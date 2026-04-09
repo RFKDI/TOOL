@@ -64,7 +64,6 @@ def load_ref_file(uploaded_file):
     xf = pd.ExcelFile(uploaded_file)
     sheet = xf.sheet_names[0]
     df = pd.read_excel(uploaded_file, sheet_name=sheet)
-    # Keep only needed columns; rename for consistent use
     keep = [c for c in ["BTSIPID", "SDCA", "SDCANAME", "SITENAME", "LOCATION",
                          "incharge", "JTO INCHARGE"] if c in df.columns]
     df = df[keep].copy()
@@ -131,6 +130,13 @@ def standardize(df, ref_df=None):
         if "SDCA" in df.columns:
             df["SDCA"] = df["SDCA"].str.strip().str.title()
 
+    # ── Always guarantee SDCA column exists ───────────────────────────────
+    # SDCA must come from ref file (via BTSIPID join) or perf file directly.
+    # NEVER fall back to SSA/SSAID — those are SSA-level names, not SDCA.
+    if "SDCA" not in df.columns:
+        df["SDCA"] = "Unknown"
+    df["SDCA"] = df["SDCA"].str.strip().str.title().fillna("Unknown")
+
     return df
 
 # ─────────────────────────── SAFE STYLER ──────────────────────────────────────
@@ -182,23 +188,62 @@ if "master_df" not in st.session_state:
     st.session_state.master_df = None
 if "ref_df" not in st.session_state:
     st.session_state.ref_df = None
-if "rev_df" not in st.session_state:         # dict: month_label → DataFrame
+if "rev_df" not in st.session_state:         # dict: month_label → DataFrame (KKD only)
     st.session_state.rev_df = {}
+if "rev_df_full" not in st.session_state:    # dict: month_label → DataFrame (all SSAs)
+    st.session_state.rev_df_full = {}
+
+# ── SSAID ↔ SSACODE mapping (TN Circle) ─────────────────────────────────────
+# SSAID  : column in Monthly Performance File  (e.g. TNKAR)
+# SSACODE: column in RBC Revenue File          (e.g. KKD)
+# Both identify the same SSA/OA. Join key: BTS IP ID (perf) = BTSIPID (RBC).
+# Confirmed mappings (user-verified):
+#   TNKUM → CRDA  (not NGC — user confirmed CRDA = TNKUM)
+#   TNNAG → NGC   (Nagercoil — NAG suffix)
+#   TNCRDA removed (TNKUM is the correct SSAID for CRDA)
+SSAID_TO_CODE = {
+    "TNCOI":"CBE",  "TNCOO":"CON",  "TNCUD":"CDL",  "TNDHA":"DPI",
+    "TNERO":"ERD",  "TNKAR":"KKD",  "TNKUM":"CRDA", "TNMAD":"MA",
+    "TNNAG":"NGC",  "TNPON":"PY",   "TNSAL":"SLM",  "TNTHA":"TNJ",
+    "TNTIR":"TVL",  "TNTRI":"TR",   "TNTUT":"TT",   "TNVEL":"VLR",
+    "TNVIR":"VGR",
+}
+# Reverse: SSACODE → SSAID (one-to-one after correction)
+CODE_TO_SSAID = {
+    "CBE":"TNCOI",  "CON":"TNCOO",  "CDL":"TNCUD",  "DPI":"TNDHA",
+    "ERD":"TNERO",  "KKD":"TNKAR",  "CRDA":"TNKUM", "MA":"TNMAD",
+    "NGC":"TNNAG",  "PY":"TNPON",   "SLM":"TNSAL",  "TNJ":"TNTHA",
+    "TVL":"TNTIR",  "TR":"TNTRI",   "TT":"TNTUT",   "VLR":"TNVEL",
+    "VGR":"TNVIR",
+}
+# Friendly display name for each SSACODE (used throughout the dashboard)
+SSA_DISPLAY = {
+    "CBE":"Coimbatore",   "CON":"Coonoor",      "CDL":"Cuddalore",
+    "DPI":"Dharmapuri",   "ERD":"Erode",        "KKD":"Karaikudi",
+    "NGC":"Nagercoil",    "MA":"Madurai",        "PY":"Pondicherry",
+    "SLM":"Salem",        "TNJ":"Thanjavur",    "TVL":"Tirunelveli",
+    "TT":"Tuticorin",     "VLR":"Vellore",      "VGR":"Virudhunagar",
+    "TR":"Trichy",        "CRDA":"CRDA",
+}
+# All 17 OA display names in alphabetical order (used in filters)
+ALL_OA_DISPLAY = sorted(SSA_DISPLAY.values())
 
 # ─────────────────────────── SIDEBAR ──────────────────────────────────────────
 
 with st.sidebar:
-    st.title("📡 KKD Dashboard")
+    st.title("📡 TN Circle Dashboard")
 
-    # ── Reference file ─────────────────────────────────────────────────────
-    st.markdown("**① Upload Reference File** (BTSIPID_PKEY1)")
-    ref_upload = st.file_uploader("Reference file", type=["xlsx"], key="ref_upload")
-    if ref_upload:
-        try:
-            st.session_state.ref_df = load_ref_file(ref_upload)
-            st.success(f"✅ Reference: {len(st.session_state.ref_df)} sites loaded")
-        except Exception as e:
-            st.error(f"Reference load error: {e}")
+    # ── Reference file (OPTIONAL — only needed for Incharge Analysis tab) ───
+    with st.expander("① Upload Reference File (optional — for Incharge Analysis only)"):
+        st.caption("BTSIPID_PKEY1 file adds incharge officer data. "
+                   "Not required for availability, revenue, or OA analysis.")
+        ref_upload = st.file_uploader("Reference file", type=["xlsx"], key="ref_upload")
+        if ref_upload:
+            try:
+                st.session_state.ref_df = load_ref_file(ref_upload)
+                st.success(f"✅ Reference: {len(st.session_state.ref_df)} sites loaded")
+            except Exception as e:
+                st.error(f"Reference load error: {e}")
 
     st.markdown("**② Upload Monthly Performance Files** (CSV / XLSX)")
     uploads = st.file_uploader("Monthly files", type=["csv", "xlsx"],
@@ -240,20 +285,51 @@ with st.sidebar:
                     m_lbl = rf.name.lower().replace(".xlsx","").replace(".csv","").replace(" ","_")
                 xf = pd.ExcelFile(rf)
                 sheet = "RBC DATA" if "RBC DATA" in xf.sheet_names else xf.sheet_names[0]
-                rdf = pd.read_excel(rf, sheet_name=sheet)
-                rdf = rdf[rdf["SSACODE"].astype(str).str.strip() == "KKD"].copy()
+                rdf_raw = pd.read_excel(rf, sheet_name=sheet)
+
+                # ── Clean & deduplicate ──────────────────────────────────
                 rev_num_cols = ["2G_Traffic","2G_Data","3G_Traffic","3G_Data","4G_Traffic","4G_Data",
                                 "TOT_TRAFFIC","TOT_DATA","TRAFFIC_REV","DATA_REV","TOT_REV","REV_LAKH",
                                 "2g_rev","3g_rev","4g_rev","Perday_2G_Erl","Perday_3G_GB","Perday_4G_GB"]
                 for c in rev_num_cols:
-                    if c in rdf.columns:
-                        rdf[c] = pd.to_numeric(rdf[c], errors="coerce")
-                rdf["BTSIPID"] = rdf["BTSIPID"].astype(str).str.strip()
-                if "SDCANAME" in rdf.columns:
-                    rdf["SDCA"] = rdf["SDCANAME"].str.strip().str.title()
-                rdf["Rev_Month"] = m_lbl
-                st.session_state.rev_df[m_lbl] = rdf
-                st.success(f"✅ Revenue {m_lbl.upper()}: {len(rdf)} KKD sites")
+                    if c in rdf_raw.columns:
+                        rdf_raw[c] = pd.to_numeric(rdf_raw[c], errors="coerce")
+                rdf_raw["BTSIPID"] = rdf_raw["BTSIPID"].astype(str).str.strip()
+
+                # Remove invalid BTSIPID (blank/0/nan = IBS micro sites with no network ID)
+                rdf_raw = rdf_raw[~rdf_raw["BTSIPID"].isin(["0","nan","","NaN","None"])].copy()
+
+                # Deduplicate: same BTSIPID billed across multiple rows (split billing)
+                # → keep first row's metadata, SUM all revenue/traffic columns
+                meta_cols_rbc = [c for c in ["PKEY","SSACODE","SSANAME","SDCANAME","SITENAME",
+                                              "LOCATION","2G_Cat","3G_Cat","4G_Cat",
+                                              "2G TECH","3G TECH","4G TECH"] if c in rdf_raw.columns]
+                sum_cols_rbc  = [c for c in rev_num_cols if c in rdf_raw.columns]
+                agg_rbc = {c: "first" for c in meta_cols_rbc}
+                agg_rbc.update({c: "sum" for c in sum_cols_rbc})
+                rdf_clean = rdf_raw.groupby("BTSIPID", sort=False).agg(agg_rbc).reset_index()
+
+                # SDCA from RBC SDCANAME (billing-authoritative)
+                if "SDCANAME" in rdf_clean.columns:
+                    rdf_clean["SDCA"] = (rdf_clean["SDCANAME"].str.strip().str.title()
+                                         .str.replace("Tirupathur","Tirupattur",regex=False))
+                rdf_clean["SDCA"] = rdf_clean.get("SDCA", pd.Series(dtype=str)).fillna("Unknown")
+                rdf_clean["SSA_Label"] = rdf_clean["SSACODE"].map(SSA_DISPLAY).fillna(rdf_clean["SSACODE"]) \
+                    if "SSACODE" in rdf_clean.columns else ""
+                rdf_clean["Rev_Month"] = m_lbl
+
+                raw_rows  = len(rdf_raw) + (rdf_raw["BTSIPID"].duplicated().sum())
+                dup_fixed = len(rdf_raw) - len(rdf_clean)
+                st.session_state.rev_df_full[m_lbl] = rdf_clean   # full circle (all SSAs, clean)
+
+                # KKD-filtered for existing tabs
+                rdf_kkd = rdf_clean[rdf_clean["SSACODE"].astype(str).str.strip() == "KKD"].copy()
+                st.session_state.rev_df[m_lbl] = rdf_kkd
+
+                st.success(f"✅ {m_lbl.upper()}: **{len(rdf_kkd)}** KKD sites · "
+                           f"**{len(rdf_clean)}** Circle sites · "
+                           f"{dup_fixed} billing splits merged · "
+                           f"{rdf_clean['SSACODE'].nunique()} SSAs loaded")
             except Exception as e:
                 st.error(f"Revenue load error ({rf.name}): {e}")
 
@@ -270,21 +346,61 @@ with st.sidebar:
         sel_months = st.multiselect("Filter Months (for trend tabs)", all_months,
                                     default=all_months)
 
+        # ── OA / SSA filter — uses SSACODE as universal key ─────────────────
+        # Collect all known SSACODEs: from perf (via SSAID→SSACODE) + from RBC
+        _perf_ssacodes = set()
+        if "SSAID" in st.session_state.master_df.columns:
+            for _ssaid in st.session_state.master_df["SSAID"].dropna().unique():
+                _sc = SSAID_TO_CODE.get(str(_ssaid).strip(), None)
+                if _sc: _perf_ssacodes.add(_sc)
+        _rbc_ssacodes = set()
+        if st.session_state.rev_df_full:
+            for _rdf in st.session_state.rev_df_full.values():
+                if "SSACODE" in _rdf.columns:
+                    _rbc_ssacodes.update(_rdf["SSACODE"].dropna().astype(str).str.strip().unique())
+        # Union: all known OAs; default to KKD if nothing loaded
+        all_known_codes = sorted((_perf_ssacodes | _rbc_ssacodes) or {"KKD"},
+                                  key=lambda c: SSA_DISPLAY.get(c, c))
+        # Format: "Karaikudi (KKD)"
+        def _oa_label(code):
+            return f"{SSA_DISPLAY.get(code, code)}  ({code})"
+        _default_code = "KKD" if "KKD" in all_known_codes else all_known_codes[0]
+        sel_ssacode = st.selectbox(
+            "🔍 OA / SSA Filter (applies to all tabs)",
+            all_known_codes,
+            index=all_known_codes.index(_default_code),
+            format_func=_oa_label,
+            key="sel_ssa_perf",
+        )
+        sel_ssa = CODE_TO_SSAID.get(sel_ssacode, sel_ssacode)  # SSACODE→SSAID for perf filter
+
         # Re-apply reference if ref loaded after perf files
         if ref_upload and st.session_state.ref_df is not None:
             if "incharge" not in st.session_state.master_df.columns:
                 st.info("Re-upload performance files to apply reference enrichment.")
     else:
-        sel_months = []
+        sel_months   = []
+        sel_ssacode  = "KKD"
+        sel_ssa      = "TNKAR"
 
 if st.session_state.master_df is None:
     st.info("👆  **Step 1:** Upload the reference file (BTSIPID_PKEY1_excel.xlsx)\n\n"
             "👆  **Step 2:** Upload monthly performance files (Jan CSV, Dec XLSX, …)")
     st.stop()
 
+# ── OA filter: sel_ssacode set in sidebar; derive SSAID set for perf filter ───
+# sel_ssacode: SSACODE string e.g. "KKD"  (set by sidebar selectbox)
+# sel_ssa    : primary SSAID e.g. "TNKAR" (fallback for single-SSAID filter)
+# For perf filter, match SSAID→SSACODE mapping (TNKUM→CRDA, TNNAG→NGC)
 df_all = st.session_state.master_df.copy()
 if sel_months:
     df_all = df_all[df_all["Month_Label"].isin(sel_months)]
+# Filter perf by SSACODE (via SSAID map) when multiple SSAs loaded
+if "SSAID" in df_all.columns:
+    df_all["_ssacode_tmp"] = df_all["SSAID"].map(SSAID_TO_CODE).fillna(df_all["SSAID"])
+    if df_all["_ssacode_tmp"].nunique() > 1:
+        df_all = df_all[df_all["_ssacode_tmp"] == sel_ssacode].copy()
+    df_all.drop(columns=["_ssacode_tmp"], inplace=True, errors="ignore")
 
 months_sorted = sorted(df_all["Month_Label"].unique(), key=month_sort_key)
 latest_month  = months_sorted[-1]    # ← always the chronologically latest
@@ -298,33 +414,109 @@ has_jto_incharge = "JTO INCHARGE" in df_all.columns
 has_location     = "LOCATION"     in df_all.columns
 has_sitename     = "SITENAME"     in df_all.columns
 
-# ── Latest-month dataframe (defined here so revenue globals can use it) ────────
+# ── Latest-month dataframe ────────────────────────────────────────────────────
 df_lat = df_all[df_all["Month_Label"] == latest_month].copy()
 
-# ── Revenue data globals ───────────────────────────────────────────────────────
-rev_store    = st.session_state.rev_df               # dict month_label→df
-has_revenue  = bool(rev_store)
-# Combined revenue dataframe (all months stacked)
+# ── STEP 1: OA / Circle revenue globals (all SSAs) ───────────────────────────
+rev_store_full = st.session_state.rev_df_full       # dict month→df, all 17 SSAs
+has_oa_revenue = bool(rev_store_full)
+if has_oa_revenue:
+    oa_rev_months_sorted = sorted(rev_store_full.keys(), key=month_sort_key)
+    oa_latest_month      = oa_rev_months_sorted[-1]
+    oa_rev_all           = pd.concat(rev_store_full.values(), ignore_index=True)
+    oa_rev_lat           = rev_store_full[oa_latest_month].copy()
+else:
+    oa_rev_months_sorted = []; oa_latest_month = None
+    oa_rev_all = None; oa_rev_lat = None
+
+# ── STEP 2: Build rev_store filtered to selected SSA ─────────────────────────
+# Must be defined BEFORE SDCA remap so we can use it as the SDCA source.
+_rev_raw = st.session_state.rev_df               # KKD-only fallback from load time
+if rev_store_full and sel_ssacode:
+    rev_store = {}
+    for _m, _rdf_full in rev_store_full.items():
+        _f = _rdf_full[_rdf_full["SSACODE"].astype(str).str.strip() == sel_ssacode].copy()
+        if len(_f):
+            rev_store[_m] = _f
+    if not rev_store:                            # SSA not in RBC — fall back
+        rev_store = _rev_raw
+else:
+    rev_store = _rev_raw
+
+# ── Add SSA_Label to perf data from SSAID (no ref needed) ───────────────────
+if "SSAID" in df_all.columns:
+    df_all["SSA_Code"]  = df_all["SSAID"].map(SSAID_TO_CODE).fillna(df_all["SSAID"])
+    df_all["SSA_Label"] = df_all["SSA_Code"].map(SSA_DISPLAY).fillna(df_all["SSA_Code"])
+    df_lat["SSA_Code"]  = df_lat["SSAID"].map(SSAID_TO_CODE).fillna(df_lat["SSAID"])
+    df_lat["SSA_Label"] = df_lat["SSA_Code"].map(SSA_DISPLAY).fillna(df_lat["SSA_Code"])
+
+# ── STEP 3: Remap SDCA in perf data from latest rev_store SDCANAME ───────────
+# RBC SDCANAME is the billing-authoritative SDCA for the selected SSA.
+# Fallback for perf sites absent from RBC: use the perf file SDCA column.
+if rev_store:
+    _sdca_src = rev_store[sorted(rev_store.keys(), key=month_sort_key)[-1]]
+    if "SDCANAME" in _sdca_src.columns:
+        _sdca_lkp = (
+            _sdca_src[["BTSIPID","SDCANAME"]]
+            .dropna(subset=["SDCANAME"])
+            .drop_duplicates("BTSIPID")
+            .set_index("BTSIPID")["SDCANAME"]
+            .str.strip().str.title()
+            .str.replace("Tirupathur", "Tirupattur", regex=False)
+        )
+        for _df in [df_all, df_lat]:
+            _mapped = _df["BTS IP ID"].map(_sdca_lkp)
+            _df["SDCA"] = _mapped.fillna(
+                _df["SDCA"].str.strip().str.title()
+                if "SDCA" in _df.columns else pd.Series("Unknown", index=_df.index)
+            ).fillna("Unknown")
+    else:
+        for _df in [df_all, df_lat]:
+            if "SDCA" not in _df.columns: _df["SDCA"] = "Unknown"
+            _df["SDCA"] = _df["SDCA"].str.strip().str.title().fillna("Unknown")
+else:
+    # No RBC at all — use perf SDCA directly
+    for _df in [df_all, df_lat]:
+        if "SDCA" not in _df.columns: _df["SDCA"] = "Unknown"
+        _df["SDCA"] = _df["SDCA"].str.strip().str.title().fillna("Unknown")
+
+# ── STEP 4: Revenue globals derived from rev_store ───────────────────────────
+has_revenue = bool(rev_store)
 if has_revenue:
-    rev_all  = pd.concat(rev_store.values(), ignore_index=True)
-    # Latest revenue month (chronologically)
+    rev_all           = pd.concat(rev_store.values(), ignore_index=True)
     rev_months_sorted = sorted(rev_store.keys(), key=month_sort_key)
     latest_rev_month  = rev_months_sorted[-1]
     rev_lat           = rev_store[latest_rev_month].copy()
-    # Merge latest perf + latest rev on BTS IP ID = BTSIPID
-    df_lat_rev = df_lat.merge(
-        rev_lat[["BTSIPID","REV_LAKH","TOT_REV","TRAFFIC_REV","DATA_REV",
+    # Ensure SDCA on rev_lat from SDCANAME
+    if "SDCANAME" in rev_lat.columns:
+        rev_lat["SDCA"] = (rev_lat["SDCANAME"].str.strip().str.title()
+                           .str.replace("Tirupathur","Tirupattur",regex=False))
+    rev_lat["SDCA"]   = rev_lat.get("SDCA", pd.Series(dtype=str)).fillna("Unknown")
+    # Merge latest perf + latest rev
+    _rev_merge_cols = [c for c in ["BTSIPID","REV_LAKH","TOT_REV","TRAFFIC_REV","DATA_REV",
                  "2G_Traffic","2G_Data","3G_Traffic","3G_Data","4G_Traffic","4G_Data",
                  "TOT_TRAFFIC","TOT_DATA","2g_rev","3g_rev","4g_rev",
                  "Perday_2G_Erl","Perday_3G_GB","Perday_4G_GB",
-                 "2G_Cat","3G_Cat","4G_Cat","2G TECH","3G TECH","4G TECH"]],
-        left_on="BTS IP ID", right_on="BTSIPID", how="left", suffixes=("","_rbc")
-    )
-    # Tech category order for sorting
+                 "2G_Cat","3G_Cat","4G_Cat","2G TECH","3G TECH","4G TECH"]
+                 if c in rev_lat.columns]
+    df_lat_rev = df_lat.merge(rev_lat[_rev_merge_cols],
+                              left_on="BTS IP ID", right_on="BTSIPID",
+                              how="left", suffixes=("","_rbc"))
     CAT_ORDER = ["VHT","HT","MT","LT","VLT"]
 else:
-    rev_all = None; rev_lat = None; df_lat_rev = None; latest_rev_month = None
-    rev_months_sorted = []; CAT_ORDER = []
+    rev_all = None; rev_lat = None; df_lat_rev = None
+    latest_rev_month = None; rev_months_sorted = []; CAT_ORDER = []
+
+# ── Active SSA banner ─────────────────────────────────────────────────────────
+_ssa_name_display = SSA_DISPLAY.get(sel_ssacode, sel_ssacode)
+_rev_site_count   = (rev_store[rev_months_sorted[-1]]["BTSIPID"].nunique()
+                     if has_revenue else 0)
+st.info(f"🔍 **Active SSA: {sel_ssa}  ({_ssa_name_display})**  —  "
+        f"Perf: {df_lat['BTS IP ID'].nunique()} sites  |  "
+        f"Revenue: {_rev_site_count} sites"
+        if has_revenue else
+        f"🔍 **Active SSA: {sel_ssa}  ({_ssa_name_display})**  —  "
+        f"Perf: {df_lat['BTS IP ID'].nunique()} sites  |  No revenue data loaded")
 
 # ─────────────────────────── TABS ─────────────────────────────────────────────
 
@@ -339,6 +531,10 @@ tab_labels = [
     "👷 Incharge Analysis",
     "💰 Revenue Report",
     "📅 Revenue Per Day",
+    "🌐 OA / Circle View",
+    "📶 Circle Availability",
+    "📊 Period Summary",
+    "🏭 Vendor Availability",
     "🏆 Executive Report",
 ]
 tabs = st.tabs(tab_labels)
@@ -1046,13 +1242,12 @@ with tabs[6]:
 
 with tabs[7]:
     st.header("👷 Incharge Analysis")
-
-    if not has_incharge and not has_jto_incharge:
-        st.warning("Incharge data not available. Please upload the reference file (BTSIPID_PKEY1_excel.xlsx) "
+    _tab7_ok = has_incharge or has_jto_incharge
+    if not _tab7_ok:
+        st.warning("Incharge data not available. Upload the reference file (BTSIPID_PKEY1_excel.xlsx) "
                    "before uploading monthly performance files.")
-        st.stop()
-
-    avail_cols_ic = [c for c in ["Nw Avail (2G)","Nw Avail (3G)","Nw Avail (4G TCS)"] if c in df_lat.columns]
+    if _tab7_ok:
+        avail_cols_ic = [c for c in ["Nw Avail (2G)","Nw Avail (3G)","Nw Avail (4G TCS)"] if c in df_lat.columns]
     traf_cols_ic  = [c for c in ["Erl (2g)","Erl (3g)","Erl Total","Data GB Total"] if c in df_lat.columns]
 
     def incharge_summary(df, col, label):
@@ -1393,15 +1588,23 @@ with tabs[7]:
 
 with tabs[8]:
     st.header("💰 Revenue Report")
-
     if not has_revenue:
         st.info("👆 Upload RBC Revenue file(s) from the sidebar (③ Upload Revenue Files) to enable this tab.")
-        st.stop()
-
-    rev_m_sel = st.selectbox("Select Revenue Month", rev_months_sorted,
+    if has_revenue:
+        rev_m_sel = st.selectbox("Select Revenue Month", rev_months_sorted,
                               index=len(rev_months_sorted)-1,
                               format_func=lambda x: x.upper())
     rdf_sel = rev_store[rev_m_sel].copy()
+    # SDCA from RBC SDCANAME (authoritative billing SDCA); normalize spelling
+    if "SDCANAME" in rdf_sel.columns:
+        rdf_sel["SDCA"] = (rdf_sel["SDCANAME"].str.strip().str.title()
+                           .str.replace("Tirupathur","Tirupattur",regex=False))
+    if "SDCA" not in rdf_sel.columns:
+        rdf_sel["SDCA"] = "Unknown"
+    rdf_sel["SDCA"] = rdf_sel["SDCA"].fillna("Unknown")
+    # Add SSA display label
+    rdf_sel["SSA_Label"] = rdf_sel["SSACODE"].map(SSA_DISPLAY).fillna(
+        rdf_sel["SSACODE"]) if "SSACODE" in rdf_sel.columns else _ssa_name_display
 
     # ── KPI row ────────────────────────────────────────────────────────────
     tot_rev   = rdf_sel["REV_LAKH"].sum()
@@ -1416,11 +1619,38 @@ with tabs[8]:
     k4.metric("Max Site Rev (Lakhs)",  f"₹ {max_rev:.3f}")
     k5.metric("Zero Revenue Sites",    zero_rev, delta_color="inverse")
 
+    # ── Technology-wise KPI strip ──────────────────────────────────────────
+    tech_rev_map = {"2G": "2g_rev", "3G": "3g_rev", "4G": "4g_rev"}
+    tech_site_map = {"2G": "2G TECH", "3G": "3G TECH", "4G": "4G TECH"}
+    tech_traffic_map = {"2G": ("2G_Traffic","2G_Data"), "3G": ("3G_Traffic","3G_Data"), "4G": ("4G_Traffic","4G_Data")}
+    available_techs = [t for t,c in tech_rev_map.items() if c in rdf_sel.columns]
+
+    if available_techs:
+        st.markdown("**Technology-wise Revenue Breakdown**")
+        tw_cols = st.columns(len(available_techs))
+        for i, tech in enumerate(available_techs):
+            rc  = tech_rev_map[tech]
+            vc  = tech_site_map.get(tech)
+            trc, drc = tech_traffic_map.get(tech, (None, None))
+            t_rev_lakh = rdf_sel[rc].sum() / 100000
+            t_sites    = int(rdf_sel[rdf_sel[vc].notna()]["BTSIPID"].nunique()) if vc and vc in rdf_sel.columns else "—"
+            t_share    = (rdf_sel[rc].sum() / rdf_sel[tech_rev_map["2G"]].add(rdf_sel[tech_rev_map["3G"]]).add(rdf_sel[tech_rev_map["4G"]]).sum() * 100) if all(c in rdf_sel.columns for c in tech_rev_map.values()) else None
+            traf_sum   = rdf_sel[trc].sum() if trc and trc in rdf_sel.columns else None
+            data_sum   = rdf_sel[drc].sum() if drc and drc in rdf_sel.columns else None
+            with tw_cols[i]:
+                share_str = f"  ({t_share:.1f}% of total)" if t_share is not None else ""
+                st.metric(f"{tech} Revenue (Lakhs)", f"₹{t_rev_lakh:.2f}{share_str}")
+                if traf_sum is not None:
+                    unit = "Erl" if tech == "2G" else "GB"
+                    st.caption(f"Traffic: {traf_sum:,.0f} {unit}  |  Data: {data_sum:,.0f} GB  |  Sites: {t_sites}")
+
     st.markdown("---")
 
     # ── Revenue by SDCA ────────────────────────────────────────────────────
     st.subheader(f"📍 Revenue by SDCA  ·  {rev_m_sel.upper()}")
-    sdca_rev = rdf_sel.groupby("SDCA").agg(
+
+    # Build SDCA summary with tech breakdown columns
+    sdca_agg = dict(
         Sites=("BTSIPID","nunique"),
         Total_Rev_Lakh=("REV_LAKH","sum"),
         Avg_Rev_Lakh=("REV_LAKH","mean"),
@@ -1428,7 +1658,12 @@ with tabs[8]:
         Zero_Sites=("REV_LAKH", lambda x: (x==0).sum()),
         Traffic_Rev=("TRAFFIC_REV","sum"),
         Data_Rev=("DATA_REV","sum"),
-    ).round(3).reset_index().sort_values("Total_Rev_Lakh", ascending=False)
+    )
+    for tech, rc in tech_rev_map.items():
+        if rc in rdf_sel.columns:
+            rdf_sel[f"{tech}_Rev_Lakh"] = rdf_sel[rc] / 100000
+            sdca_agg[f"{tech}_Rev_Lakh"] = (f"{tech}_Rev_Lakh", "sum")
+    sdca_rev = rdf_sel.groupby("SDCA").agg(**sdca_agg).round(3).reset_index().sort_values("Total_Rev_Lakh", ascending=False)
 
     col_r1, col_r2 = st.columns([1.4, 1])
     with col_r1:
@@ -1439,8 +1674,20 @@ with tabs[8]:
         fig_srev.update_layout(xaxis_tickangle=-30, coloraxis_showscale=False)
         st.plotly_chart(fig_srev, use_container_width=True)
     with col_r2:
-        st.markdown("**SDCA Revenue Table**")
+        st.markdown("**SDCA Revenue Table (with 2G / 3G / 4G split)**")
         st.dataframe(sdca_rev.reset_index(drop=True), use_container_width=True, hide_index=True)
+
+    # Stacked bar: 2G + 3G + 4G revenue by SDCA
+    tech_sdca_cols = [c for c in ["2G_Rev_Lakh","3G_Rev_Lakh","4G_Rev_Lakh"] if c in sdca_rev.columns]
+    if tech_sdca_cols:
+        sdca_tech_melt = sdca_rev.melt("SDCA", tech_sdca_cols, var_name="Technology", value_name="Rev_Lakh")
+        sdca_tech_melt["Technology"] = sdca_tech_melt["Technology"].str.replace("_Rev_Lakh","")
+        st.plotly_chart(px.bar(sdca_tech_melt, x="SDCA", y="Rev_Lakh", color="Technology",
+                               barmode="stack",
+                               title=f"2G / 3G / 4G Revenue by SDCA (Lakhs) — {rev_m_sel.upper()}",
+                               color_discrete_map={"2G":"#636EFA","3G":"#EF553B","4G":"#00CC96"},
+                               text="Rev_Lakh").update_traces(texttemplate="%{text:.2f}", textposition="inside"),
+                        use_container_width=True)
 
     # Traffic vs Data revenue split by SDCA
     sdca_rev_melt = sdca_rev.melt("SDCA", ["Traffic_Rev","Data_Rev"], var_name="Type", value_name="Rev")
@@ -1449,6 +1696,25 @@ with tabs[8]:
                            title="Traffic vs Data Revenue by SDCA",
                            color_discrete_map={"Traffic":"#636EFA","Data":"#EF553B"}),
                     use_container_width=True)
+
+    # Technology × SDCA heatmap
+    if tech_sdca_cols and "SDCA" in sdca_rev.columns:
+        st.markdown("**Technology Revenue Heatmap — SDCA × Technology (Lakhs)**")
+        heat_df = sdca_rev.set_index("SDCA")[tech_sdca_cols].rename(
+            columns={c: c.replace("_Rev_Lakh","") for c in tech_sdca_cols})
+        import plotly.graph_objects as _go  # noqa: already imported as go at top
+        fig_heat = go.Figure(data=go.Heatmap(
+            z=heat_df.values.tolist(),
+            x=heat_df.columns.tolist(),
+            y=heat_df.index.tolist(),
+            colorscale="Greens",
+            text=[[f"₹{v:.2f}L" for v in row] for row in heat_df.values.tolist()],
+            texttemplate="%{text}",
+            hoverongaps=False,
+        ))
+        fig_heat.update_layout(title=f"Revenue Heatmap: SDCA × Technology — {rev_m_sel.upper()}",
+                               height=400)
+        st.plotly_chart(fig_heat, use_container_width=True)
 
     st.markdown("---")
 
@@ -2181,15 +2447,19 @@ with tabs[8]:
 
 with tabs[9]:
     st.header("📅 Revenue Per Day Analysis")
-
     if not has_revenue:
         st.info("👆 Upload RBC Revenue file(s) from the sidebar to enable this tab.")
-        st.stop()
-
-    pd_m_sel = st.selectbox("Select Month", rev_months_sorted,
+    if has_revenue:
+        pd_m_sel = st.selectbox("Select Month", rev_months_sorted,
                              index=len(rev_months_sorted)-1,
                              format_func=lambda x: x.upper(), key="pd_month")
     rdf_pd = rev_store[pd_m_sel].copy()
+    if "SDCANAME" in rdf_pd.columns:
+        rdf_pd["SDCA"] = (rdf_pd["SDCANAME"].str.strip().str.title()
+                          .str.replace("Tirupathur","Tirupattur",regex=False))
+    if "SDCA" not in rdf_pd.columns:
+        rdf_pd["SDCA"] = "Unknown"
+    rdf_pd["SDCA"] = rdf_pd["SDCA"].fillna("Unknown")
 
     perday_cols = [c for c in ["Perday_2G_Erl","Perday_3G_GB","Perday_4G_GB"] if c in rdf_pd.columns]
 
@@ -2307,10 +2577,1686 @@ with tabs[9]:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# TAB 11 – Executive Report
+# TAB 11 – OA / Circle View
 # ═══════════════════════════════════════════════════════════════════════════════
 
 with tabs[10]:
+    st.header("🌐 OA / Circle View — TN Circle Revenue Analysis")
+
+    if not has_oa_revenue:
+        st.info("👆 Upload an RBC revenue file (③ in sidebar) to enable Circle-level analysis.\n\n"
+                "**Important:** Re-upload the RBC file after updating the code to populate Circle data.")
+    if has_oa_revenue:
+        # Month selector
+        oa_m_sel = st.selectbox("Revenue Month", oa_rev_months_sorted,
+                             index=len(oa_rev_months_sorted)-1,
+                             format_func=lambda x: x.upper(), key="oa_month_sel")
+    oa_df = rev_store_full[oa_m_sel].copy()
+    if "SDCANAME" in oa_df.columns:
+        oa_df["SDCA"] = (oa_df["SDCANAME"].str.strip().str.title()
+                         .str.replace("Tirupathur","Tirupattur",regex=False))
+    if "SDCA" not in oa_df.columns:
+        oa_df["SDCA"] = "Unknown"
+    oa_df["SDCA"] = oa_df["SDCA"].fillna("Unknown")
+
+    # Ensure SSA_Label exists
+    oa_df["SSA_Label"] = oa_df["SSACODE"].map(SSA_DISPLAY).fillna(oa_df["SSACODE"])
+
+    # ── OA Aggregation helper ──────────────────────────────────────────────
+    def oa_agg(df):
+        tech_rev_map_oa = {"2G":"2g_rev","3G":"3g_rev","4G":"4g_rev"}
+        agg = dict(
+            SSA_Name=("SSA_Label","first"),
+            Sites=("BTSIPID","nunique"),
+            Total_Rev_Lakh=("REV_LAKH","sum"),
+            Avg_Rev_Lakh=("REV_LAKH","mean"),
+            Max_Rev_Lakh=("REV_LAKH","max"),
+            Zero_Sites=("REV_LAKH", lambda x:(x==0).sum()),
+        )
+        for tech, rc in tech_rev_map_oa.items():
+            if rc in df.columns:
+                df[f"__{tech}_L"] = df[rc] / 100000
+                agg[f"{tech}_Rev_Lakh"] = (f"__{tech}_L","sum")
+        for tc in ["TOT_TRAFFIC","TOT_DATA","TRAFFIC_REV","DATA_REV"]:
+            if tc in df.columns: agg[tc] = (tc,"sum")
+        result = df.groupby("SSACODE").agg(**agg).round(3).reset_index()
+        result["vs_Circle_Avg_%"] = (
+            (result["Avg_Rev_Lakh"] - result["Avg_Rev_Lakh"].mean())
+            / result["Avg_Rev_Lakh"].mean() * 100
+        ).round(1)
+        return result.sort_values("Total_Rev_Lakh", ascending=False)
+
+    oa_ssa = oa_agg(oa_df)
+
+    # ── Circle KPIs ────────────────────────────────────────────────────────
+    st.subheader(f"📊 Circle Summary — {oa_m_sel.upper()}")
+    ck1, ck2, ck3, ck4, ck5 = st.columns(5)
+    ck1.metric("Circle Total Revenue (Lakhs)", f"₹{oa_df['REV_LAKH'].sum():.2f}")
+    ck2.metric("Total Sites (unique)",          oa_df["BTSIPID"].nunique())
+    ck3.metric("SSAs",                          oa_df["SSACODE"].nunique())
+    ck4.metric("Avg Rev/Site (Lakhs)",          f"₹{oa_df['REV_LAKH'].mean():.3f}")
+    ck5.metric("Zero Revenue Sites",            int((oa_df["REV_LAKH"]==0).sum()))
+
+    tech_rev_oa = {"2G":"2g_rev","3G":"3g_rev","4G":"4g_rev"}
+    tw1, tw2, tw3 = st.columns(3)
+    tot_oa = sum(oa_df[rc].sum() for rc in tech_rev_oa.values() if rc in oa_df.columns)
+    for col_tw, (tech, rc) in zip([tw1,tw2,tw3], tech_rev_oa.items()):
+        if rc in oa_df.columns:
+            v     = oa_df[rc].sum() / 100000
+            share = v / (tot_oa/100000) * 100 if tot_oa else 0
+            col_tw.metric(f"{tech} Revenue (Lakhs)", f"₹{v:.2f}  ({share:.1f}%)")
+    st.markdown("---")
+
+    # ── Revenue by SSA — bar + table ───────────────────────────────────────
+    st.subheader("📍 Revenue by SSA")
+    col_oa1, col_oa2 = st.columns([1.5, 1])
+    with col_oa1:
+        fig_oa = px.bar(oa_ssa, x="SSA_Name", y="Total_Rev_Lakh",
+                        color="Total_Rev_Lakh", color_continuous_scale="Greens",
+                        text="Total_Rev_Lakh",
+                        title=f"Total Revenue by SSA — {oa_m_sel.upper()}")
+        fig_oa.update_traces(texttemplate="₹%{text:.2f}L", textposition="outside")
+        fig_oa.update_layout(xaxis_tickangle=-35, coloraxis_showscale=False)
+        st.plotly_chart(fig_oa, use_container_width=True)
+    with col_oa2:
+        show_ssa_cols = [c for c in ["SSA_Name","Sites","Total_Rev_Lakh","Avg_Rev_Lakh",
+                                      "Max_Rev_Lakh","Zero_Sites","vs_Circle_Avg_%",
+                                      "2G_Rev_Lakh","3G_Rev_Lakh","4G_Rev_Lakh"] if c in oa_ssa.columns]
+        def _ssa_style(val):
+            try:
+                v = float(val)
+                if v > 0:  return "background-color:#d4edda;color:#155724"
+                if v < 0:  return "background-color:#f8d7da;color:#721c24"
+            except: pass
+            return ""
+        st.dataframe(safe_style(oa_ssa[show_ssa_cols].reset_index(drop=True), _ssa_style,
+                                ["vs_Circle_Avg_%"]),
+                     use_container_width=True, hide_index=True)
+
+    # Stacked bar 2G/3G/4G
+    tech_ssa_cols = [c for c in ["2G_Rev_Lakh","3G_Rev_Lakh","4G_Rev_Lakh"] if c in oa_ssa.columns]
+    if tech_ssa_cols:
+        oa_tech_melt = oa_ssa.melt("SSA_Name", tech_ssa_cols, var_name="Technology", value_name="Rev_Lakh")
+        oa_tech_melt["Technology"] = oa_tech_melt["Technology"].str.replace("_Rev_Lakh","")
+        st.plotly_chart(px.bar(oa_tech_melt, x="SSA_Name", y="Rev_Lakh", color="Technology",
+                               barmode="stack",
+                               title=f"2G / 3G / 4G Revenue Split by SSA — {oa_m_sel.upper()}",
+                               color_discrete_map={"2G":"#636EFA","3G":"#EF553B","4G":"#00CC96"},
+                               text="Rev_Lakh").update_traces(texttemplate="%{text:.1f}",
+                                                              textposition="inside"),
+                        use_container_width=True)
+
+    # Avg revenue/site — normalised comparison
+    st.plotly_chart(px.bar(oa_ssa.sort_values("Avg_Rev_Lakh", ascending=False),
+                           x="SSA_Name", y="Avg_Rev_Lakh",
+                           color="vs_Circle_Avg_%", color_continuous_scale="RdYlGn",
+                           text="Avg_Rev_Lakh",
+                           title="Avg Revenue/Site by SSA — Normalised (green = above circle avg)"),
+                    use_container_width=True)
+
+    # Heatmap: SSA × Technology
+    if tech_ssa_cols:
+        st.markdown("**SSA × Technology Revenue Heatmap (Lakhs)**")
+        heat_oa = oa_ssa.set_index("SSA_Name")[tech_ssa_cols].rename(
+            columns={c: c.replace("_Rev_Lakh","") for c in tech_ssa_cols})
+        fig_oa_heat = go.Figure(data=go.Heatmap(
+            z=heat_oa.values.tolist(), x=heat_oa.columns.tolist(), y=heat_oa.index.tolist(),
+            colorscale="YlGn",
+            text=[[f"₹{v:.2f}L" for v in row] for row in heat_oa.values.tolist()],
+            texttemplate="%{text}", hoverongaps=False,
+        ))
+        fig_oa_heat.update_layout(title=f"Revenue Heatmap: SSA × Technology — {oa_m_sel.upper()}", height=520)
+        st.plotly_chart(fig_oa_heat, use_container_width=True)
+    st.markdown("---")
+
+    # ── Worst Sites — Circle Wide ──────────────────────────────────────────
+    st.subheader("🔴 Worst Sites — Circle Wide")
+    wc1, wc2, wc3 = st.columns(3)
+    with wc1:
+        oa_worst_n = st.slider("Number of worst sites", 10, 100, 25, 5, key="oa_worst_n")
+    with wc2:
+        oa_worst_metric = st.selectbox("Rank by", ["Revenue (Lakhs)","4G Per-Day GB","3G Per-Day GB"],
+                                        key="oa_worst_metric")
+    with wc3:
+        oa_worst_ssa = st.multiselect("Filter SSA", sorted(oa_df["SSA_Label"].dropna().unique()),
+                                       default=sorted(oa_df["SSA_Label"].dropna().unique()),
+                                       key="oa_worst_ssa")
+    metric_col_map = {"Revenue (Lakhs)":"REV_LAKH","4G Per-Day GB":"Perday_4G_GB",
+                      "3G Per-Day GB":"Perday_3G_GB"}
+    worst_col = metric_col_map[oa_worst_metric]
+    oa_worst_df = oa_df[oa_df["SSA_Label"].isin(oa_worst_ssa)].copy() if oa_worst_ssa else oa_df.copy()
+    if worst_col not in oa_worst_df.columns:
+        st.info(f"Column {worst_col} not available in this RBC file.")
+    else:
+        worst_sites = oa_worst_df.nsmallest(oa_worst_n, worst_col)
+        worst_show = [c for c in ["BTSIPID","SITENAME","SSACODE","SSA_Label","SDCA",
+                                   "REV_LAKH","2G_Cat","3G_Cat","4G_Cat",
+                                   "Perday_4G_GB","Perday_3G_GB","Perday_2G_Erl",
+                                   "LOCATION","2G TECH","3G TECH","4G TECH"] if c in worst_sites.columns]
+        # Bar chart: worst sites
+        st.plotly_chart(px.bar(worst_sites.sort_values(worst_col), x="BTSIPID", y=worst_col,
+                               color="SSA_Label", title=f"Bottom {oa_worst_n} Sites by {oa_worst_metric}",
+                               labels={"BTSIPID":"Site", worst_col:oa_worst_metric,"SSA_Label":"SSA"}),
+                        use_container_width=True)
+        st.dataframe(worst_sites[worst_show].reset_index(drop=True), use_container_width=True, hide_index=True)
+
+    # Per-SSA worst sites expander
+    with st.expander("📂 Per-SSA Worst 5 Sites"):
+        for scode in sorted(oa_df["SSACODE"].dropna().unique()):
+            sdf = oa_df[oa_df["SSACODE"]==scode]
+            sname = SSA_DISPLAY.get(scode, scode)
+            worst5 = sdf.nsmallest(5,"REV_LAKH")[["BTSIPID","SITENAME","SDCA","REV_LAKH","4G_Cat"]]
+            st.markdown(f"**{sname} ({scode})** — worst 5 revenue sites")
+            st.dataframe(worst5.reset_index(drop=True), use_container_width=True, hide_index=True)
+    st.markdown("---")
+
+    # ── Revenue Concentration & Distribution ──────────────────────────────
+    st.subheader("📊 Revenue Distribution & Concentration")
+    dist_c1, dist_c2 = st.columns(2)
+    with dist_c1:
+        # Circle-level revenue histogram
+        st.plotly_chart(px.histogram(oa_df, x="REV_LAKH", color="SSA_Label", nbins=50,
+                                     title="Revenue Distribution — All Sites (Circle)",
+                                     labels={"REV_LAKH":"Revenue (Lakhs)","SSA_Label":"SSA"}),
+                        use_container_width=True)
+    with dist_c2:
+        # 4G category distribution by SSA
+        if "4G_Cat" in oa_df.columns:
+            cat_oa = oa_df.groupby(["SSA_Label","4G_Cat"])["BTSIPID"].count().reset_index()
+            cat_oa.columns = ["SSA","4G_Cat","Sites"]
+            cat_oa = cat_oa[cat_oa["4G_Cat"].notna()]
+            st.plotly_chart(px.bar(cat_oa, x="SSA", y="Sites", color="4G_Cat",
+                                   barmode="stack", title="4G Traffic Category by SSA",
+                                   color_discrete_map={"VHT":"#1a9641","HT":"#a6d96a",
+                                                       "MT":"#ffffbf","LT":"#fdae61","VLT":"#d7191c"},
+                                   category_orders={"4G_Cat":["VHT","HT","MT","LT","VLT"]}),
+                            use_container_width=True)
+
+    # Top-N sites concentration — what % of sites drive 80% revenue?
+    oa_sorted = oa_df.sort_values("REV_LAKH", ascending=False).reset_index(drop=True)
+    oa_sorted["Cumulative_Rev"] = oa_sorted["REV_LAKH"].cumsum()
+    total_oa_rev = oa_sorted["REV_LAKH"].sum()
+    oa_sorted["Cumulative_%"] = (oa_sorted["Cumulative_Rev"] / total_oa_rev * 100).round(2)
+    sites_80 = int((oa_sorted["Cumulative_%"] <= 80).sum())
+    pct_sites_80 = round(sites_80 / len(oa_sorted) * 100, 1)
+    st.info(f"📌 **{sites_80} sites ({pct_sites_80}% of all sites)** generate **80%** of Circle revenue — "
+            f"top {sites_80} sites average ₹{oa_sorted.head(sites_80)['REV_LAKH'].mean():.2f}L each.")
+    st.plotly_chart(px.line(oa_sorted.head(min(500, len(oa_sorted))),
+                            x=oa_sorted.head(min(500,len(oa_sorted))).index,
+                            y="Cumulative_%", color="SSA_Label",
+                            title="Cumulative Revenue % — Top 500 Sites by SSA",
+                            labels={"x":"Site rank","Cumulative_%":"Cumulative Revenue %"}),
+                    use_container_width=True)
+    st.markdown("---")
+
+    # ── Underperforming SSAs — Below Circle Average ────────────────────────
+    st.subheader("⚠️ Underperforming SSAs — Below Circle Average")
+    circle_avg_rev = oa_df["REV_LAKH"].mean()
+    under_ssa = oa_ssa[oa_ssa["Avg_Rev_Lakh"] < circle_avg_rev].copy()
+    if len(under_ssa):
+        st.caption(f"Circle avg revenue/site = ₹{circle_avg_rev:.3f}L. "
+                   f"{len(under_ssa)} SSAs are below this benchmark.")
+        st.plotly_chart(px.bar(under_ssa.sort_values("vs_Circle_Avg_%"),
+                               x="SSA_Name", y="vs_Circle_Avg_%",
+                               color="vs_Circle_Avg_%", color_continuous_scale="Reds_r",
+                               text="vs_Circle_Avg_%",
+                               title="Underperforming SSAs — % Below Circle Avg Revenue/Site"),
+                        use_container_width=True)
+
+        # Revenue gap — how much revenue is lost vs if they performed at circle avg?
+        under_ssa["Rev_Gap_Lakh"] = ((circle_avg_rev - under_ssa["Avg_Rev_Lakh"]) * under_ssa["Sites"]).round(2)
+        st.markdown("**Revenue gap vs Circle average (uplift potential):**")
+        st.dataframe(under_ssa[["SSA_Name","Sites","Avg_Rev_Lakh","vs_Circle_Avg_%","Rev_Gap_Lakh"]]
+                     .sort_values("Rev_Gap_Lakh", ascending=False).reset_index(drop=True),
+                     use_container_width=True, hide_index=True)
+        total_gap = under_ssa["Rev_Gap_Lakh"].sum()
+        st.warning(f"💡 If underperforming SSAs matched circle average, "
+                   f"potential additional revenue = **₹{total_gap:.2f} Lakhs/month**")
+    st.markdown("---")
+
+    # ── Traffic vs Revenue by SSA ──────────────────────────────────────────
+    st.subheader("📶 Traffic vs Revenue Analysis")
+    if "TOT_TRAFFIC" in oa_ssa.columns:
+        tr_sc = oa_ssa.copy()
+        tr_sc["Avg_Traffic/Site"] = (tr_sc["TOT_TRAFFIC"] / tr_sc["Sites"]).round(1)
+        st.plotly_chart(px.scatter(tr_sc, x="Avg_Traffic/Site", y="Avg_Rev_Lakh",
+                                   size="Sites", color="SSA_Name",
+                                   text="SSA_Name",
+                                   title="Avg Traffic per Site vs Avg Revenue per Site — Circle SSAs",
+                                   labels={"Avg_Traffic/Site":"Avg Traffic/Site",
+                                           "Avg_Rev_Lakh":"Avg Revenue/Site (Lakhs)"},
+                                   trendline="ols"),
+                        use_container_width=True)
+    st.markdown("---")
+
+    # ── SSA Drill-down ─────────────────────────────────────────────────────
+    st.subheader("🔍 SSA Drill-down — SDCA & Site Level")
+    ssa_opts = sorted(oa_ssa["SSA_Name"].dropna().unique())
+    ssa_sel_oa = st.selectbox("Select SSA", ssa_opts,
+                               index=ssa_opts.index("Karaikudi") if "Karaikudi" in ssa_opts else 0,
+                               key="oa_ssa_drill")
+    sel_code_oa = oa_ssa[oa_ssa["SSA_Name"]==ssa_sel_oa]["SSACODE"].iloc[0]         if len(oa_ssa[oa_ssa["SSA_Name"]==ssa_sel_oa]) else None
+
+    if sel_code_oa:
+        ssa_detail = oa_df[oa_df["SSACODE"]==sel_code_oa].copy()
+        d1, d2, d3, d4 = st.columns(4)
+        d1.metric("Sites",              ssa_detail["BTSIPID"].nunique())
+        d2.metric("Total Revenue",      f"₹{ssa_detail['REV_LAKH'].sum():.2f}L")
+        d3.metric("Avg Rev/Site",       f"₹{ssa_detail['REV_LAKH'].mean():.3f}L")
+        d4.metric("Zero Rev Sites",     int((ssa_detail["REV_LAKH"]==0).sum()))
+
+        if "SDCA" in ssa_detail.columns:
+            sdca_oa = ssa_detail.groupby("SDCA").agg(
+                Sites=("BTSIPID","nunique"),
+                Total_Rev=("REV_LAKH","sum"),
+                Avg_Rev=("REV_LAKH","mean"),
+                Zero_Sites=("REV_LAKH", lambda x:(x==0).sum()),
+            ).round(3).reset_index().sort_values("Total_Rev", ascending=False)
+            da1, da2 = st.columns([1.4,1])
+            with da1:
+                st.plotly_chart(px.bar(sdca_oa, x="SDCA", y="Total_Rev",
+                    color="Total_Rev", color_continuous_scale="Greens", text="Total_Rev",
+                    title=f"{ssa_sel_oa} — Revenue by SDCA").update_traces(
+                        texttemplate="₹%{text:.2f}L", textposition="outside"),
+                    use_container_width=True)
+            with da2:
+                st.dataframe(sdca_oa, use_container_width=True, hide_index=True)
+
+        show_oa_cols = [c for c in ["BTSIPID","SITENAME","SDCA","LOCATION",
+                        "REV_LAKH","2G_Cat","3G_Cat","4G_Cat",
+                        "Perday_2G_Erl","Perday_3G_GB","Perday_4G_GB"] if c in ssa_detail.columns]
+        st.markdown(f"**{ssa_sel_oa} — {ssa_detail['BTSIPID'].nunique()} Sites**")
+        st.dataframe(ssa_detail[show_oa_cols].sort_values("REV_LAKH", ascending=False)
+                     .reset_index(drop=True).round(3), use_container_width=True, hide_index=True)
+    st.markdown("---")
+
+    # ── MoM Circle Trend ──────────────────────────────────────────────────
+    if len(oa_rev_months_sorted) >= 2:
+        st.subheader("📈 Circle Revenue Trend — Month on Month")
+        trend_rows = []
+        for m in oa_rev_months_sorted:
+            mdf = rev_store_full[m]
+            row = {"Month": m.upper(), "Total_Rev": round(mdf["REV_LAKH"].sum(),2),
+                   "Sites": mdf["BTSIPID"].nunique()}
+            for tech, rc in tech_rev_oa.items():
+                if rc in mdf.columns:
+                    row[f"{tech}_Rev"] = round(mdf[rc].sum()/100000, 2)
+            trend_rows.append(row)
+        trend_df = pd.DataFrame(trend_rows)
+        st.plotly_chart(px.line(trend_df, x="Month", y="Total_Rev", markers=True,
+                                text="Total_Rev", title="Circle Total Revenue Trend (Lakhs)"),
+                        use_container_width=True)
+        tech_trend_cols = [c for c in ["2G_Rev","3G_Rev","4G_Rev"] if c in trend_df.columns]
+        if tech_trend_cols:
+            tt_melt = trend_df.melt("Month", tech_trend_cols, var_name="Tech", value_name="Rev_Lakh")
+            tt_melt["Tech"] = tt_melt["Tech"].str.replace("_Rev","")
+            st.plotly_chart(px.line(tt_melt, x="Month", y="Rev_Lakh", color="Tech", markers=True,
+                                    title="2G / 3G / 4G Revenue Trend — Circle",
+                                    color_discrete_map={"2G":"#636EFA","3G":"#EF553B","4G":"#00CC96"}),
+                            use_container_width=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════════
+# TAB 12 – Circle Availability (OA-wise Intelligence)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+with tabs[11]:
+    st.header("📶 Circle Availability — OA-wise Intelligence Report")
+    st.caption(
+        "Availability analysis across all uploaded performance months. "
+        "OA (SSA) dimension is derived from the SSAID column in the perf file — "
+        "no reference file needed. Upload perf files for multiple SSAs to enable cross-OA comparison."
+    )
+
+    # ── This tab uses ALL uploaded perf data — NOT the global OA filter ─────
+    # The global sidebar OA filter (sel_ssacode) applies to all other tabs.
+    # This tab has its OWN OA multiselect, so we start from the full master_df.
+    # Filter only by month selection (sel_months) so the month filter still works.
+    _av_df = st.session_state.master_df.copy()
+    if sel_months:
+        _av_df = _av_df[_av_df["Month_Label"].isin(sel_months)]
+    # Map SSA_Code and SSA_Label from SSAID (always present in perf file)
+    if "SSAID" in _av_df.columns:
+        _av_df["SSA_Code"]  = _av_df["SSAID"].map(SSAID_TO_CODE).fillna(_av_df["SSAID"])
+        _av_df["SSA_Label"] = _av_df["SSA_Code"].map(SSA_DISPLAY).fillna(_av_df["SSA_Code"])
+    else:
+        _av_df["SSA_Code"]  = sel_ssacode
+        _av_df["SSA_Label"] = SSA_DISPLAY.get(sel_ssacode, sel_ssacode)
+    # Normalise availability columns
+    for _ac in ["Nw Avail (2G)", "Nw Avail (3G)", "Nw Avail (4G TCS)"]:
+        if _ac in _av_df.columns:
+            _av_df[_ac] = pd.to_numeric(_av_df[_ac], errors="coerce")
+
+    AVAIL_TECH    = {"2G": "Nw Avail (2G)", "3G": "Nw Avail (3G)", "4G": "Nw Avail (4G TCS)"}
+    avail_present = {t: c for t, c in AVAIL_TECH.items() if c in _av_df.columns}
+    months_avail  = sorted(_av_df["Month_Label"].unique(), key=month_sort_key)
+    latest_av_m   = months_avail[-1]
+    _av_lat       = _av_df[_av_df["Month_Label"] == latest_av_m]
+
+    if not avail_present:
+        st.warning("No availability columns found in the uploaded performance files.")
+    # ── Build OA list from perf SSAID column (full master_df) + RBC SSACODE ──
+    # _perf_codes: every SSACODE found in the FULL uploaded perf data
+    _perf_codes = set()
+    if "SSAID" in _av_df.columns:
+        for _sid in _av_df["SSAID"].dropna().unique():
+            _sc = SSAID_TO_CODE.get(str(_sid).strip())
+            if _sc:
+                _perf_codes.add(_sc)
+    # Also add any SSACODE directly in perf file (some files use SSACODE not SSAID)
+    if "SSACODE" in _av_df.columns:
+        _perf_codes.update(_av_df["SSACODE"].dropna().astype(str).str.strip().unique())
+    _rbc_codes = set()
+    if rev_store_full:
+        for _rdf_av in rev_store_full.values():
+            if "SSACODE" in _rdf_av.columns:
+                _rbc_codes.update(_rdf_av["SSACODE"].dropna().astype(str).str.strip().unique())
+    # All known OAs (union of perf + RBC). Sort by display name.
+    all_codes_av = sorted(_perf_codes | _rbc_codes or {"KKD"},
+                          key=lambda c: SSA_DISPLAY.get(c, c))
+    if not all_codes_av:
+        all_codes_av = list(SSA_DISPLAY.keys())
+
+    # ── Controls row 1: sliders ────────────────────────────────────────────
+    cc1, cc2, cc3 = st.columns(3)
+    with cc1:
+        av_thr     = st.slider("Poor availability threshold (%)", 80, 98, 90, 1, key="av_thr2")
+    with cc2:
+        av_worst_n = st.slider("Worst sites to show per OA", 5, 30, 10, 5, key="av_worst_n2")
+    with cc3:
+        av_rep_n   = st.slider("Chronic: bottom-N per month", 5, 30, 10, 5, key="av_rep_n2")
+
+    # ── Controls row 2: OA multiselect with ALL checkbox ──────────────────
+    oa_fc1, oa_fc2 = st.columns([5, 1])
+    with oa_fc2:
+        select_all_oa = st.checkbox("ALL", value=True, key="av_oa_all",
+                                    help="Select all 17 OAs")
+    with oa_fc1:
+        # Options: "Karaikudi (KKD)" — code is embedded for exact matching
+        av_opts = [f"{SSA_DISPLAY.get(c,c)}  ({c})" for c in all_codes_av]
+        av_opts_perf_only = [f"{SSA_DISPLAY.get(c,c)}  ({c})"
+                             for c in all_codes_av if c in _perf_codes]
+        if select_all_oa:
+            av_sel_opts = st.multiselect(
+                "🔍 OA / SSA Filter — all 17 OAs listed; ⚙️ uncheck ALL to pick specific OAs",
+                av_opts, default=av_opts, key="av_oa_sel", disabled=True)
+            av_sel_opts = av_opts   # force all
+        else:
+            av_sel_opts = st.multiselect(
+                "🔍 OA / SSA Filter — select one or more OAs",
+                av_opts,
+                default=av_opts_perf_only if av_opts_perf_only else av_opts[:1],
+                key="av_oa_sel")
+            if not av_sel_opts:
+                st.warning("Please select at least one OA.")
+                av_sel_opts = av_opts  # fall back to all
+
+    # Extract SSACODE from option string e.g. "Karaikudi  (KKD)" → "KKD"
+    import re as _re
+    av_sel_codes = [_re.search(r'\((\w+)\)$', o.strip()).group(1)
+                    for o in av_sel_opts if _re.search(r'\((\w+)\)\s*$', o)]
+    av_codes_perf = [c for c in av_sel_codes if c in _perf_codes]
+    av_codes_noperf = [c for c in av_sel_codes if c not in _perf_codes]
+
+    # Filter _av_df to selected OAs that have perf data
+    # Match via SSAID→SSACODE (TNKUM→CRDA, TNNAG→NGC)
+    if "SSAID" in _av_df.columns:
+        _av_df["_tmp_code"] = _av_df["SSAID"].map(SSAID_TO_CODE).fillna(_av_df["SSAID"])
+        if av_codes_perf:
+            _av_df = _av_df[_av_df["_tmp_code"].isin(av_codes_perf)].copy()
+        _av_df.drop(columns=["_tmp_code"], inplace=True, errors="ignore")
+    _av_lat = _av_df[_av_df["Month_Label"] == latest_av_m]
+
+    # Set SSA_Label from SSACODE for display
+    if "SSAID" in _av_df.columns:
+        _av_df["SSA_Code"]  = _av_df["SSAID"].map(SSAID_TO_CODE).fillna(_av_df["SSAID"])
+        _av_df["SSA_Label"] = _av_df["SSA_Code"].map(SSA_DISPLAY).fillna(_av_df["SSA_Code"])
+        _av_lat["SSA_Code"]  = _av_lat["SSAID"].map(SSAID_TO_CODE).fillna(_av_lat["SSAID"])
+        _av_lat["SSA_Label"] = _av_lat["SSA_Code"].map(SSA_DISPLAY).fillna(_av_lat["SSA_Code"])
+    else:
+        _av_df["SSA_Label"]  = SSA_DISPLAY.get(sel_ssacode, sel_ssacode)
+        _av_lat["SSA_Label"] = SSA_DISPLAY.get(sel_ssacode, sel_ssacode)
+
+    multi_oa = len(av_codes_perf) > 1
+    av_oa_perf = [SSA_DISPLAY.get(c, c) for c in av_codes_perf]
+
+    # Warnings / status
+    if av_codes_noperf:
+        st.warning(
+            f"⚠️ **{len(av_codes_noperf)} OA(s) selected have no perf file uploaded:** "
+            f"{', '.join(SSA_DISPLAY.get(c,c) for c in av_codes_noperf)}. "
+            f"Upload their monthly performance files to include them here."
+        )
+    if not av_codes_perf:
+        st.warning("No OAs with performance data selected. Showing all available OAs.")
+        av_codes_perf = list(_perf_codes) if _perf_codes else []
+    if av_codes_perf:
+        st.info(
+            f"📊 **{len(av_codes_perf)} OA(s) with perf data:** "
+            f"{', '.join(SSA_DISPLAY.get(c,c)+' ('+c+')' for c in av_codes_perf)}"
+            + (f"  |  Revenue data available for all 17 OAs in RBC tab." if _rbc_codes else "")
+        )
+
+    st.markdown("---")
+
+    # ══════════════════════════════════════════════════════════════════════
+    # ══════════════════════════════════════════════════════════════════════
+    # SECTION 0 – Node Count & Availability Full Summary
+    # ══════════════════════════════════════════════════════════════════════
+    st.subheader("📡 Node Count & Availability — Full Summary")
+    st.caption("Physical sites = unique BTS IP ID. "
+               "Radio nodes = 2G cnt + 3G cnt + 4G cnt (a site can have multiple). "
+               "Technology presence = non-null BTS Site ID for that band.")
+
+    # Helper: is BTS Site ID column populated (physical node present)?
+    def _has_sid(df, col):
+        if col not in df.columns:
+            return pd.Series(False, index=df.index)
+        s = df[col].astype(str).str.strip()
+        return ~s.isin(["", "nan", "NaN", "None", "0", "<NA>", "nan"])
+
+    # ── Per-month summary ──────────────────────────────────────────────────
+    node_rows = []
+    for _m in months_avail:
+        _mdf = _av_df[_av_df["Month_Label"] == _m].copy()
+        for _c in ["2G cnt","3G cnt","4G cnt","Total cnt"]:
+            if _c in _mdf.columns:
+                _mdf[_c] = pd.to_numeric(_mdf[_c], errors="coerce")
+
+        _h2g  = _has_sid(_mdf, "BTS Site ID (2G)")
+        _h3g  = _has_sid(_mdf, "BTS Site ID (3G)")
+        _h700 = _has_sid(_mdf, "BTS Site ID (700)")
+        _h2100= _has_sid(_mdf, "BTS Site ID (2100)")
+        _h2500= _has_sid(_mdf, "BTS Site ID (2500)")
+        _h4g  = _h700 | _h2100 | _h2500
+
+        row = {"Month": _m.upper()}
+        row["Physical Sites"]       = int(_mdf["BTS IP ID"].nunique())
+        row["Total Radio Nodes"]    = int(_mdf["Total cnt"].sum()) if "Total cnt" in _mdf.columns else 0
+        row["2G Nodes (cnt)"]       = int(_mdf["2G cnt"].sum())    if "2G cnt"    in _mdf.columns else 0
+        row["3G Nodes (cnt)"]       = int(_mdf["3G cnt"].sum())    if "3G cnt"    in _mdf.columns else 0
+        row["4G Nodes (cnt)"]       = int(_mdf["4G cnt"].sum())    if "4G cnt"    in _mdf.columns else 0
+        row["2G Sites (Site ID)"]   = int(_h2g.sum())
+        row["3G Sites (Site ID)"]   = int(_h3g.sum())
+        row["4G Sites (any band)"]  = int(_h4g.sum())
+        row["700 MHz Sites"]        = int(_h700.sum())
+        row["2100 MHz Sites"]       = int(_h2100.sum())
+        row["2500 MHz Sites"]       = int(_h2500.sum())
+        row["2G+3G+4G Sites"]       = int((_h2g & _h3g & _h4g).sum())
+
+        for _tech, _col_av in avail_present.items():
+            _av = _mdf[_col_av].dropna()
+            row[f"{_tech} Avg%"]    = round(_av.mean(), 2) if len(_av) else None
+            row[f"{_tech} Min%"]    = round(_av.min(),  2) if len(_av) else None
+            row[f"{_tech} Max%"]    = round(_av.max(),  2) if len(_av) else None
+            row[f"{_tech} =100%"]   = int((_av == 100).sum())
+            row[f"{_tech} ≥99%"]    = int((_av >= 99).sum())
+            row[f"{_tech} ≥95%"]    = int((_av >= 95).sum())
+            row[f"{_tech} ≥90%"]    = int((_av >= 90).sum())
+            row[f"{_tech} <90%"]    = int((_av <  90).sum())
+            row[f"{_tech} <80%"]    = int((_av <  80).sum())
+            row[f"{_tech} <70%"]    = int((_av <  70).sum())
+            _phys_col = "BTS Site ID (2G)" if _tech=="2G" else                         "BTS Site ID (3G)" if _tech=="3G" else None
+            _phys_mask = _has_sid(_mdf, _phys_col) if _phys_col else _h4g
+            row[f"{_tech} Nodes w/ Data"] = int(_phys_mask.sum())
+            row[f"{_tech} No Avail Data"] = int(_phys_mask.sum() - len(_av))
+        node_rows.append(row)
+
+    node_df = pd.DataFrame(node_rows)
+
+    # ── KPI strip for latest month ──────────────────────────────────────────
+    _lat_row = node_df[node_df["Month"] == latest_av_m.upper()].iloc[0]         if len(node_df) else {}
+    k0,k1,k2,k3,k4 = st.columns(5)
+    k0.metric("Physical Sites",     _lat_row.get("Physical Sites","—"))
+    k1.metric("Total Radio Nodes",  _lat_row.get("Total Radio Nodes","—"))
+    k2.metric("2G Nodes",           _lat_row.get("2G Nodes (cnt)","—"))
+    k3.metric("3G Nodes",           _lat_row.get("3G Nodes (cnt)","—"))
+    k4.metric("4G Nodes",           _lat_row.get("4G Nodes (cnt)","—"))
+
+    kk1,kk2,kk3,kk4,kk5 = st.columns(5)
+    kk1.metric("2G Sites (physical)", _lat_row.get("2G Sites (Site ID)","—"))
+    kk2.metric("3G Sites (physical)", _lat_row.get("3G Sites (Site ID)","—"))
+    kk3.metric("4G Sites (any band)", _lat_row.get("4G Sites (any band)","—"))
+    kk4.metric("2G+3G+4G Sites",      _lat_row.get("2G+3G+4G Sites","—"))
+    kk5.metric("700 MHz / 2100 / 2500",
+               f"{_lat_row.get('700 MHz Sites','—')} / "
+               f"{_lat_row.get('2100 MHz Sites','—')} / "
+               f"{_lat_row.get('2500 MHz Sites','—')}")
+
+    st.markdown("---")
+
+    # ── Full node + availability summary table ─────────────────────────────
+    st.markdown("**📋 Month-wise Node Count & Availability Table**")
+    # Show in two parts: node counts, then availability
+    node_count_cols = ["Month","Physical Sites","Total Radio Nodes",
+                       "2G Nodes (cnt)","3G Nodes (cnt)","4G Nodes (cnt)",
+                       "2G Sites (Site ID)","3G Sites (Site ID)","4G Sites (any band)",
+                       "700 MHz Sites","2100 MHz Sites","2500 MHz Sites","2G+3G+4G Sites"]
+    avail_cols_table = ["Month"]
+    for _tech in avail_present:
+        avail_cols_table += [f"{_tech} Nodes w/ Data", f"{_tech} No Avail Data",
+                             f"{_tech} Avg%", f"{_tech} Min%", f"{_tech} Max%",
+                             f"{_tech} =100%", f"{_tech} ≥99%", f"{_tech} ≥95%",
+                             f"{_tech} ≥90%", f"{_tech} <90%", f"{_tech} <80%",
+                             f"{_tech} <70%"]
+    nc_c, av_c = st.columns(2)
+    with nc_c:
+        st.markdown("**Node Counts**")
+        _nc = node_df[[c for c in node_count_cols if c in node_df.columns]]
+        st.dataframe(_nc.reset_index(drop=True), use_container_width=True, hide_index=True)
+    with av_c:
+        st.markdown("**Availability Buckets**")
+        _ac = node_df[[c for c in avail_cols_table if c in node_df.columns]]
+        def _bucket_colour(v):
+            try:
+                fv = float(v)
+                if fv < 90:  return "background-color:#f8d7da;color:#721c24"
+                if fv < 95:  return "background-color:#fff3cd;color:#856404"
+                return "background-color:#d4edda;color:#155724"
+            except: return ""
+        avg_pct_cols = [f"{t} Avg%" for t in avail_present]
+        st.dataframe(safe_style(_ac.reset_index(drop=True), _bucket_colour, avg_pct_cols),
+                     use_container_width=True, hide_index=True)
+
+    st.markdown("---")
+
+    # ── Stacked node composition bar ──────────────────────────────────────
+    st.markdown("**📊 Radio Node Composition per Month**")
+    _bar_data = []
+    for _, _r in node_df.iterrows():
+        for _tech, _col in [("2G","2G Nodes (cnt)"),("3G","3G Nodes (cnt)"),("4G","4G Nodes (cnt)")]:
+            if _col in _r:
+                _bar_data.append({"Month":_r["Month"],"Technology":_tech,"Nodes":_r[_col]})
+    if _bar_data:
+        _bar_df = pd.DataFrame(_bar_data)
+        fig_nodes = px.bar(_bar_df, x="Month", y="Nodes", color="Technology",
+                           barmode="stack", text="Nodes",
+                           title="Radio Nodes by Technology per Month",
+                           color_discrete_map={"2G":"#636EFA","3G":"#EF553B","4G":"#00CC96"})
+        fig_nodes.update_traces(textposition="inside")
+        st.plotly_chart(fig_nodes, use_container_width=True)
+
+    # ── Technology combo donut (latest month) ─────────────────────────────
+    _mdf_lat = _av_df[_av_df["Month_Label"] == latest_av_m].copy()
+    _h2g_l  = _has_sid(_mdf_lat, "BTS Site ID (2G)")
+    _h3g_l  = _has_sid(_mdf_lat, "BTS Site ID (3G)")
+    _h700_l = _has_sid(_mdf_lat, "BTS Site ID (700)")
+    _h2100_l= _has_sid(_mdf_lat, "BTS Site ID (2100)")
+    _h2500_l= _has_sid(_mdf_lat, "BTS Site ID (2500)")
+    _h4g_l  = _h700_l | _h2100_l | _h2500_l
+    combo_counts = {
+        "2G + 3G + 4G": int((_h2g_l & _h3g_l & _h4g_l).sum()),
+        "2G + 4G only": int((_h2g_l & ~_h3g_l & _h4g_l).sum()),
+        "2G + 3G only": int((_h2g_l & _h3g_l & ~_h4g_l).sum()),
+        "4G only":      int((~_h2g_l & ~_h3g_l & _h4g_l).sum()),
+        "2G only":      int((_h2g_l & ~_h3g_l & ~_h4g_l).sum()),
+        "3G only":      int((~_h2g_l & _h3g_l & ~_h4g_l).sum()),
+        "No tech data": int((~_h2g_l & ~_h3g_l & ~_h4g_l).sum()),
+    }
+    combo_df = pd.DataFrame(list(combo_counts.items()),
+                            columns=["Technology Mix","Sites"])
+    combo_df = combo_df[combo_df["Sites"] > 0]
+
+    _dc1, _dc2 = st.columns(2)
+    with _dc1:
+        fig_combo = px.pie(combo_df, names="Technology Mix", values="Sites",
+                           hole=0.4,
+                           title=f"Technology Mix per Physical Site — {latest_av_m.upper()}",
+                           color_discrete_sequence=px.colors.qualitative.Set2)
+        st.plotly_chart(fig_combo, use_container_width=True)
+    with _dc2:
+        st.markdown(f"**Site Technology Breakdown — {latest_av_m.upper()}**")
+        st.dataframe(combo_df.reset_index(drop=True), use_container_width=True, hide_index=True)
+
+    # ── 4G Band-wise node + availability breakdown ─────────────────────────
+    if "4G" in avail_present:
+        st.markdown("**📡 4G Band-wise Breakdown**")
+        _col4g = avail_present["4G"]
+        band_def = {
+            "A — 700 only":       _h700_l & ~_h2100_l & ~_h2500_l,
+            "B — 700 + 2100":     _h700_l & _h2100_l  & ~_h2500_l,
+            "D — 700+2100+2500":  _h700_l & _h2100_l  & _h2500_l,
+            "2100 only":          ~_h700_l & _h2100_l & ~_h2500_l,
+            "2500 only":          ~_h700_l & ~_h2100_l & _h2500_l,
+        }
+        band_rows = []
+        for _label, _mask in band_def.items():
+            if _mask.sum() == 0: continue
+            _avail = _mdf_lat.loc[_mask, _col4g].dropna()
+            band_rows.append({
+                "Band": _label,
+                "Sites": int(_mask.sum()),
+                "Avg Avail%": round(_avail.mean(), 2) if len(_avail) else None,
+                "Min%": round(_avail.min(), 2) if len(_avail) else None,
+                "≥95%": int((_avail >= 95).sum()),
+                "<90%": int((_avail <  90).sum()),
+                "<70%": int((_avail <  70).sum()),
+            })
+        if band_rows:
+            band_df = pd.DataFrame(band_rows)
+            _bd1, _bd2 = st.columns([1, 1.4])
+            with _bd1:
+                st.dataframe(band_df.reset_index(drop=True),
+                             use_container_width=True, hide_index=True)
+            with _bd2:
+                fig_band2 = px.bar(band_df, x="Band", y="Avg Avail%",
+                                   color="Avg Avail%",
+                                   color_continuous_scale=[[0,"#d7191c"],[0.5,"#fdae61"],[1,"#1a9641"]],
+                                   range_color=[80,100], text="Avg Avail%",
+                                   title=f"4G Avg Availability by Band — {latest_av_m.upper()}")
+                fig_band2.update_traces(texttemplate="%{text:.1f}%", textposition="outside")
+                fig_band2.add_hline(y=av_thr, line_dash="dash", line_color="red")
+                fig_band2.update_layout(coloraxis_showscale=False, yaxis_range=[70, 105])
+                st.plotly_chart(fig_band2, use_container_width=True)
+
+    # ── OA-wise node + availability summary table ─────────────────────────
+    st.markdown(f"**🗺️ OA-wise Node & Availability Summary — {latest_av_m.upper()}**")
+    oa_node_rows = []
+    for _oa in sorted(_av_lat["SSA_Label"].dropna().unique()):
+        _odf = _av_lat[_av_lat["SSA_Label"] == _oa].copy()
+        for _c in ["2G cnt","3G cnt","4G cnt","Total cnt"]:
+            if _c in _odf.columns:
+                _odf[_c] = pd.to_numeric(_odf[_c], errors="coerce")
+        _oh2g = _has_sid(_odf,"BTS Site ID (2G)")
+        _oh3g = _has_sid(_odf,"BTS Site ID (3G)")
+        _oh4g = (_has_sid(_odf,"BTS Site ID (700)") |
+                 _has_sid(_odf,"BTS Site ID (2100)") |
+                 _has_sid(_odf,"BTS Site ID (2500)"))
+        _orow = {"OA": _oa,
+                 "Sites": int(_odf["BTS IP ID"].nunique()),
+                 "Total Nodes": int(_odf["Total cnt"].sum()) if "Total cnt" in _odf.columns else 0,
+                 "2G": int(_odf["2G cnt"].sum()) if "2G cnt" in _odf.columns else 0,
+                 "3G": int(_odf["3G cnt"].sum()) if "3G cnt" in _odf.columns else 0,
+                 "4G": int(_odf["4G cnt"].sum()) if "4G cnt" in _odf.columns else 0,
+                 "2G+3G+4G": int((_oh2g & _oh3g & _oh4g).sum())}
+        for _tech, _col_av in avail_present.items():
+            _av = _odf[_col_av].dropna()
+            _orow[f"{_tech} Avg%"] = round(_av.mean(), 2) if len(_av) else None
+            _orow[f"{_tech} <90%"] = int((_av < 90).sum()) if len(_av) else 0
+            _orow[f"{_tech} <70%"] = int((_av < 70).sum()) if len(_av) else 0
+        oa_node_rows.append(_orow)
+
+    if oa_node_rows:
+        oa_node_df = pd.DataFrame(oa_node_rows)
+        avg_oa_cols = [f"{t} Avg%" for t in avail_present if f"{t} Avg%" in oa_node_df.columns]
+        st.dataframe(safe_style(oa_node_df.reset_index(drop=True), _bucket_colour, avg_oa_cols),
+                     use_container_width=True, hide_index=True)
+
+    st.markdown("---")
+
+    # SECTION 1 – OA × Technology Summary Table & KPI Cards
+    # ══════════════════════════════════════════════════════════════════════
+    st.subheader("📊 OA × Technology Availability Summary")
+
+    # Build summary: OA × Tech, latest month
+    oa_tech_rows = []
+    for oa in sorted(_av_df["SSA_Label"].dropna().unique()):
+        row = {"OA": oa}
+        for tech, col in avail_present.items():
+            sub = _av_lat[_av_lat["SSA_Label"] == oa][col].dropna()
+            row[f"{tech} Avg%"]      = round(sub.mean(), 2) if len(sub) else None
+            row[f"{tech} <{av_thr}%"] = int((sub < av_thr).sum()) if len(sub) else 0
+            row[f"{tech} Sites"]     = int(len(sub))
+        oa_tech_rows.append(row)
+    oa_tech_df = pd.DataFrame(oa_tech_rows)
+
+    # KPI cards — one per tech
+    kpi_c = st.columns(len(avail_present))
+    for ki, (tech, col) in enumerate(avail_present.items()):
+        s = _av_lat[col].dropna()
+        kpi_c[ki].metric(
+            f"{tech} Circle Avg",
+            f"{s.mean():.2f}%" if len(s) else "N/A",
+            delta=f"{int((s < av_thr).sum())} sites <{av_thr}%"
+        )
+
+    # OA × Tech table with colour
+    def _av_cell_colour(v):
+        try:
+            fv = float(v)
+            if fv < 90:  return "background-color:#f8d7da;color:#721c24"
+            if fv < 95:  return "background-color:#fff3cd;color:#856404"
+            return "background-color:#d4edda;color:#155724"
+        except: return ""
+
+    avg_cols = [c for c in oa_tech_df.columns if "Avg%" in c]
+    st.dataframe(
+        safe_style(oa_tech_df.reset_index(drop=True), _av_cell_colour, avg_cols),
+        use_container_width=True, hide_index=True
+    )
+
+    # OA comparison bar (multi-OA)
+    if multi_oa and avg_cols:
+        oa_melt = oa_tech_df.melt("OA", avg_cols, var_name="Technology", value_name="Avg Avail %")
+        oa_melt["Technology"] = oa_melt["Technology"].str.replace(" Avg%","")
+        fig_oa_bar = px.bar(
+            oa_melt, x="OA", y="Avg Avail %", color="Technology",
+            barmode="group", text="Avg Avail %",
+            title=f"OA-wise Availability by Technology — {latest_av_m.upper()}",
+            color_discrete_map={"2G":"#636EFA","3G":"#EF553B","4G":"#00CC96"}
+        )
+        fig_oa_bar.update_traces(texttemplate="%{text:.1f}%", textposition="outside")
+        fig_oa_bar.add_hline(y=av_thr, line_dash="dash", line_color="red",
+                             annotation_text=f"{av_thr}%")
+        fig_oa_bar.update_layout(yaxis_range=[60,105])
+        st.plotly_chart(fig_oa_bar, use_container_width=True)
+
+    st.markdown("---")
+
+    # ══════════════════════════════════════════════════════════════════════
+    # SECTION 2 – OA × Technology × Month Heatmaps
+    # ══════════════════════════════════════════════════════════════════════
+    st.subheader("🗺️ OA × Technology Availability Heatmap (Month-on-Month)")
+    ht1, ht2, ht3 = st.tabs(list(avail_present.keys()))
+    for htab, (tech, col) in zip([ht1, ht2, ht3], avail_present.items()):
+        with htab:
+            pivot = (_av_df.groupby(["SSA_Label","Month_Label"])[col]
+                     .mean().round(2).reset_index()
+                     .pivot(index="SSA_Label", columns="Month_Label", values=col))
+            pivot.columns = [c.upper() for c in pivot.columns]
+            if len(pivot) == 0:
+                st.info("No data."); continue
+            fig_hm = go.Figure(data=go.Heatmap(
+                z=pivot.values.tolist(),
+                x=pivot.columns.tolist(),
+                y=pivot.index.tolist(),
+                colorscale=[[0,"#d7191c"],[0.45,"#fdae61"],[0.6,"#ffffbf"],[1,"#1a9641"]],
+                zmin=70, zmax=100,
+                text=[[f"{v:.1f}%" if pd.notna(v) else "N/A" for v in row]
+                      for row in pivot.values.tolist()],
+                texttemplate="%{text}", hoverongaps=False,
+            ))
+            fig_hm.update_layout(
+                title=f"{tech} Availability % — OA × Month",
+                height=max(350, len(pivot)*55 + 120)
+            )
+            st.plotly_chart(fig_hm, use_container_width=True)
+
+            # MoM trend lines
+            if len(months_avail) >= 2:
+                mom_data = (_av_df.groupby(["SSA_Label","Month_Label"])[col]
+                            .mean().round(2).reset_index())
+                mom_data["Month_Label"] = mom_data["Month_Label"].str.upper()
+                fig_line = px.line(
+                    mom_data, x="Month_Label", y=col,
+                    color="SSA_Label", markers=True,
+                    title=f"{tech} Availability Trend by OA",
+                    labels={col:"Avg Avail %","Month_Label":"Month","SSA_Label":"OA"}
+                )
+                fig_line.add_hline(y=av_thr, line_dash="dash", line_color="red",
+                                   annotation_text=f"{av_thr}%")
+                st.plotly_chart(fig_line, use_container_width=True)
+
+    st.markdown("---")
+
+    # ══════════════════════════════════════════════════════════════════════
+    # SECTION 3 – Worst Performers per OA per Technology
+    # ══════════════════════════════════════════════════════════════════════
+    st.subheader(f"🔴 Worst {av_worst_n} Sites per OA — Technology-wise ({latest_av_m.upper()})")
+    for tech, col in avail_present.items():
+        st.markdown(f"#### {tech}")
+        for oa in sorted(_av_df["SSA_Label"].dropna().unique()):
+            sub = _av_lat[_av_lat["SSA_Label"] == oa][
+                ["BTS IP ID","BTS Name","SSA_Label", col]
+            ].dropna(subset=[col])
+            if len(sub) == 0: continue
+            worst = sub.nsmallest(av_worst_n, col).reset_index(drop=True)
+            oa_avg = sub[col].mean()
+            below  = (sub[col] < av_thr).sum()
+
+            with st.expander(
+                f"**{oa}** — {len(sub)} sites · Avg {oa_avg:.1f}% · "
+                f"**{below} sites <{av_thr}%** {'⚠️' if below>0 else '✅'}",
+                expanded=(below > 0)
+            ):
+                fig_w = px.bar(
+                    worst, x="BTS IP ID", y=col,
+                    color=col,
+                    color_continuous_scale=[[0,"#d7191c"],[0.4,"#fdae61"],[1,"#1a9641"]],
+                    range_color=[40,100],
+                    text=col, hover_data=["BTS Name"],
+                    title=f"Worst {av_worst_n} {tech} — {oa}"
+                )
+                fig_w.update_traces(texttemplate="%{text:.1f}%", textposition="outside")
+                fig_w.add_hline(y=av_thr, line_dash="dash", line_color="red")
+                fig_w.update_layout(coloraxis_showscale=False, yaxis_range=[0,105])
+                st.plotly_chart(fig_w, use_container_width=True)
+                st.dataframe(worst, use_container_width=True, hide_index=True)
+
+    st.markdown("---")
+
+    # ══════════════════════════════════════════════════════════════════════
+    # SECTION 4 – Chronic Poor Performers per OA (all months)
+    # ══════════════════════════════════════════════════════════════════════
+    st.subheader(f"🔁 Chronic Poor Performers — Repeated Worst across All Months")
+    if len(months_avail) < 2:
+        st.info("Upload ≥ 2 months of performance data to identify chronic offenders.")
+    else:
+        for tech, col in avail_present.items():
+            st.markdown(f"#### {tech} — Chronic Offenders")
+            any_chronic = False
+            for oa in sorted(_av_df["SSA_Label"].dropna().unique()):
+                sets = []
+                for m in months_avail:
+                    sub = _av_df[
+                        (_av_df["Month_Label"]==m) & (_av_df["SSA_Label"]==oa)
+                    ][["BTS IP ID", col]].dropna(subset=[col])
+                    # Only sites ACTUALLY below threshold qualify as poor performers
+                    # Without this filter, nsmallest(N) returns N rows even if all are 100%
+                    sub_poor = sub[sub[col] < av_thr]
+                    if len(sub_poor) >= av_rep_n:
+                        sets.append(set(sub_poor.nsmallest(av_rep_n, col)["BTS IP ID"]))
+                    elif len(sub_poor) > 0:
+                        # Fewer than N poor sites — use all of them
+                        sets.append(set(sub_poor["BTS IP ID"]))
+                    else:
+                        # No poor sites this month for this OA — cannot be chronic
+                        sets.append(set())
+                if len(sets) < len(months_avail): continue
+                # Must have appeared in poor list in EVERY month
+                chronic_ids = set.intersection(*sets)
+                if not chronic_ids: continue
+                any_chronic = True
+
+                rows = []
+                for sid in sorted(chronic_ids):
+                    row = {"BTS IP ID": sid}
+                    sname = _av_df[_av_df["BTS IP ID"]==sid]["BTS Name"].iloc[0] \
+                        if sid in _av_df["BTS IP ID"].values else ""
+                    row["BTS Name"] = sname
+                    row["OA"]       = oa
+                    for m in months_avail:
+                        v = _av_df[
+                            (_av_df["BTS IP ID"]==sid) & (_av_df["Month_Label"]==m)
+                        ][col]
+                        row[m.upper()] = round(v.values[0], 2) if len(v) else None
+                    row["Avg All"] = round(
+                        _av_df[_av_df["BTS IP ID"]==sid][col].mean(), 2)
+                    rows.append(row)
+                chronic_df = pd.DataFrame(rows).sort_values("Avg All")
+                mcols = [m.upper() for m in months_avail]
+
+                st.warning(
+                    f"⚠️ **{oa}** — **{len(chronic_ids)} sites** appear in the worst "
+                    f"{av_rep_n} {tech} sites in every month ({', '.join(m.upper() for m in months_avail)})"
+                )
+                st.dataframe(
+                    safe_style(chronic_df.reset_index(drop=True), _av_cell_colour,
+                               mcols + ["Avg All"]),
+                    use_container_width=True, hide_index=True
+                )
+                fig_ch = px.bar(
+                    chronic_df, x="BTS IP ID", y="Avg All",
+                    color="Avg All",
+                    color_continuous_scale=[[0,"#d7191c"],[0.5,"#fdae61"],[1,"#a6d96a"]],
+                    range_color=[40,95], text="Avg All",
+                    hover_data=["BTS Name","OA"],
+                    title=f"{tech} Chronic Offenders — {oa} (avg across {len(months_avail)} months)"
+                )
+                fig_ch.update_traces(texttemplate="%{text:.1f}%", textposition="outside")
+                fig_ch.update_layout(coloraxis_showscale=False, yaxis_range=[0,100])
+                st.plotly_chart(fig_ch, use_container_width=True)
+
+            if not any_chronic:
+                st.success(f"✅ No chronic {tech} offenders found across {', '.join(m.upper() for m in months_avail)}.")
+
+    st.markdown("---")
+
+    # ══════════════════════════════════════════════════════════════════════
+    # SECTION 5 – Cross-OA Comparison (multi-OA only)
+    # ══════════════════════════════════════════════════════════════════════
+    if multi_oa:
+        st.subheader("🆚 Cross-OA Availability Ranking")
+        for tech, col in avail_present.items():
+            rank_rows = []
+            for oa in sorted(_av_df["SSA_Label"].dropna().unique()):
+                sub = _av_lat[_av_lat["SSA_Label"] == oa][col].dropna()
+                if len(sub) == 0: continue
+                rank_rows.append({
+                    "OA": oa, "Sites": len(sub),
+                    "Avg Avail%": round(sub.mean(),2),
+                    f"<{av_thr}% Sites": int((sub<av_thr).sum()),
+                    "<90% Sites": int((sub<90).sum()),
+                    "<95% Sites": int((sub<95).sum()),
+                    "Min%": round(sub.min(),2),
+                    "Worst Site": sub.idxmin() if hasattr(sub,'idxmin') else ""
+                })
+            if not rank_rows: continue
+            rank_df = pd.DataFrame(rank_rows).sort_values("Avg Avail%")
+            st.markdown(f"**{tech} OA Ranking (worst → best)**")
+            st.dataframe(
+                safe_style(rank_df.reset_index(drop=True), _av_cell_colour, ["Avg Avail%"]),
+                use_container_width=True, hide_index=True
+            )
+            st.plotly_chart(
+                px.bar(rank_df.sort_values("Avg Avail%"),
+                       x="OA", y="Avg Avail%",
+                       color="Avg Avail%",
+                       color_continuous_scale=[[0,"#d7191c"],[0.5,"#fdae61"],[1,"#1a9641"]],
+                       range_color=[85,100], text="Avg Avail%",
+                       title=f"{tech} OA Ranking — {latest_av_m.upper()}"
+                       ).update_traces(texttemplate="%{text:.1f}%", textposition="outside"),
+                use_container_width=True
+            )
+        st.markdown("---")
+
+    # ══════════════════════════════════════════════════════════════════════
+    # SECTION 6 – Vendor-wise Availability per OA
+    # ══════════════════════════════════════════════════════════════════════
+    st.subheader("🏭 Vendor-wise Availability")
+    vendor_map_av = {"2G": "Vendor 2g", "3G": "Vendor 3g"}
+    for tech, col in avail_present.items():
+        ven_col = vendor_map_av.get(tech)
+        if not ven_col or ven_col not in _av_df.columns: continue
+        vd = (_av_df.groupby([ven_col, "SSA_Label", "Month_Label"])[col]
+              .mean().round(2).reset_index())
+        vd["Month_Label"] = vd["Month_Label"].str.upper()
+        fig_vd = px.bar(
+            vd, x=ven_col, y=col, color="Month_Label",
+            facet_col="SSA_Label" if multi_oa else None,
+            barmode="group", text=col,
+            title=f"{tech} Availability by Vendor" + (" & OA" if multi_oa else ""),
+            labels={col:"Avg Avail %"}
+        )
+        fig_vd.update_traces(texttemplate="%{text:.1f}%", textposition="outside")
+        fig_vd.add_hline(y=av_thr, line_dash="dash", line_color="red")
+        fig_vd.update_layout(yaxis_range=[75,102])
+        st.plotly_chart(fig_vd, use_container_width=True)
+
+    st.markdown("---")
+
+    # ══════════════════════════════════════════════════════════════════════
+    # SECTION 7 – Urban vs Rural per OA
+    # ══════════════════════════════════════════════════════════════════════
+    if "BTS Area" in _av_df.columns:
+        st.subheader("🌆 Urban vs Rural Availability by OA")
+        for tech, col in avail_present.items():
+            ur = (_av_df.groupby(["SSA_Label","BTS Area","Month_Label"])[col]
+                  .mean().round(2).reset_index())
+            ur["Month_Label"] = ur["Month_Label"].str.upper()
+            ur["Group"] = ur["SSA_Label"] + " · " + ur["BTS Area"]
+            fig_ur = px.bar(
+                ur, x="Month_Label", y=col, color="BTS Area",
+                facet_col="SSA_Label" if multi_oa else None,
+                barmode="group", text=col,
+                title=f"{tech} Urban vs Rural — by OA",
+                color_discrete_map={"Urban":"#636EFA","Rural":"#EF553B"},
+                labels={col:"Avg Avail %"}
+            )
+            fig_ur.update_traces(texttemplate="%{text:.1f}%", textposition="outside")
+            fig_ur.add_hline(y=av_thr, line_dash="dash", line_color="red")
+            fig_ur.update_layout(yaxis_range=[75,102])
+            st.plotly_chart(fig_ur, use_container_width=True)
+        st.markdown("---")
+
+    # ══════════════════════════════════════════════════════════════════════
+    # SECTION 8 – Band-wise Availability (4G)
+    # ══════════════════════════════════════════════════════════════════════
+    if "Band category" in _av_df.columns and "4G" in avail_present:
+        st.subheader("📡 4G Band-wise Availability by OA")
+        col4g = avail_present["4G"]
+        bd = (_av_df.groupby(["SSA_Label","Band category","Month_Label"])[col4g]
+              .agg(Avg="mean", Sites="count").round(2).reset_index())
+        bd["Month_Label"] = bd["Month_Label"].str.upper()
+        fig_bd = px.bar(
+            bd, x="Band category", y="Avg", color="Month_Label",
+            facet_col="SSA_Label" if multi_oa else None,
+            barmode="group", text="Avg",
+            title="4G Availability by Band Category & OA",
+            hover_data=["Sites"], labels={"Avg":"Avg 4G Avail %"}
+        )
+        fig_bd.update_traces(texttemplate="%{text:.1f}%", textposition="outside")
+        fig_bd.add_hline(y=av_thr, line_dash="dash", line_color="red")
+        fig_bd.update_layout(yaxis_range=[75,102])
+        st.plotly_chart(fig_bd, use_container_width=True)
+        st.markdown("---")
+
+    # ══════════════════════════════════════════════════════════════════════
+    # SECTION 9 – Multi-Technology Poor Sites per OA
+    # ══════════════════════════════════════════════════════════════════════
+    st.subheader(f"⚠️ Multi-Technology Poor Sites per OA (<{av_thr}% in 2+ technologies)")
+    for oa in sorted(_av_df["SSA_Label"].dropna().unique()):
+        sub = _av_lat[_av_lat["SSA_Label"] == oa].copy()
+        flags  = {}
+        for tech, col in avail_present.items():
+            if col in sub.columns:
+                sub[f"Poor_{tech}"] = sub[col] < av_thr
+                flags[tech] = f"Poor_{tech}"
+        if flags:
+            sub["Poor_Count"] = sub[list(flags.values())].sum(axis=1)
+            multi = sub[sub["Poor_Count"] >= 2]
+            show_c = ["BTS IP ID","BTS Name","Poor_Count"] + list(avail_present.values())
+            show_c = [c for c in show_c if c in multi.columns]
+            if len(multi):
+                st.warning(f"⚠️ **{oa}** — {len(multi)} sites below {av_thr}% in 2+ technologies")
+                st.dataframe(multi[show_c].sort_values("Poor_Count",ascending=False)
+                             .reset_index(drop=True).round(2),
+                             use_container_width=True, hide_index=True)
+            else:
+                st.success(f"✅ **{oa}** — No multi-technology poor sites.")
+
+    st.markdown("---")
+
+    # ══════════════════════════════════════════════════════════════════════
+    # SECTION 10 – MoM Deterioration per OA
+    # ══════════════════════════════════════════════════════════════════════
+    if len(months_avail) >= 2:
+        st.subheader("📉 MoM Availability Change per OA")
+        mom_tech_sel = st.selectbox("Technology", list(avail_present.keys()), key="av_mom2")
+        mom_col  = avail_present[mom_tech_sel]
+        m_p, m_c = months_avail[-2], months_avail[-1]
+
+        for oa in sorted(_av_df["SSA_Label"].dropna().unique()):
+            oa_sub = _av_df[_av_df["SSA_Label"] == oa]
+            prev   = oa_sub[oa_sub["Month_Label"]==m_p].set_index("BTS IP ID")[mom_col]
+            curr   = oa_sub[oa_sub["Month_Label"]==m_c].set_index("BTS IP ID")[mom_col]
+            chg    = (curr - prev).dropna().reset_index()
+            chg.columns = ["BTS IP ID","Change%"]
+            chg = chg.merge(
+                _av_lat[["BTS IP ID","BTS Name"]].drop_duplicates(), on="BTS IP ID", how="left")
+            if len(chg) == 0: continue
+
+            with st.expander(
+                f"**{oa}** — {mom_tech_sel} change {m_p.upper()}→{m_c.upper()} "
+                f"| Deteriorated: {(chg['Change%']<0).sum()} | Improved: {(chg['Change%']>0).sum()}",
+                expanded=False
+            ):
+                dc1, dc2 = st.columns(2)
+                with dc1:
+                    st.markdown(f"**🔴 Top 10 Deteriorated**")
+                    st.dataframe(chg.nsmallest(10,"Change%").reset_index(drop=True),
+                                 use_container_width=True, hide_index=True)
+                with dc2:
+                    st.markdown(f"**🟢 Top 10 Improved**")
+                    st.dataframe(chg.nlargest(10,"Change%").reset_index(drop=True),
+                                 use_container_width=True, hide_index=True)
+                fig_chg = px.histogram(chg, x="Change%", nbins=25,
+                                       title=f"{mom_tech_sel} Avail Change — {oa}",
+                                       color_discrete_sequence=["#636EFA"])
+                fig_chg.add_vline(x=0, line_dash="solid", line_color="black")
+                st.plotly_chart(fig_chg, use_container_width=True)
+
+    st.markdown("---")
+
+    # ══════════════════════════════════════════════════════════════════════
+    # SECTION 11 – Availability Distribution Buckets per OA
+    # ══════════════════════════════════════════════════════════════════════
+    st.subheader("📊 Availability Distribution Buckets per OA")
+    bk_tech = st.selectbox("Technology", list(avail_present.keys()), key="av_bucket2")
+    bk_col  = avail_present[bk_tech]
+
+    bucket_rows = []
+    for oa in sorted(_av_df["SSA_Label"].dropna().unique()):
+        s = _av_lat[_av_lat["SSA_Label"]==oa][bk_col].dropna()
+        if len(s) == 0: continue
+        bucket_rows.append({
+            "OA": oa, "Total": len(s),
+            "Critical (<70%)":    int((s<70).sum()),
+            "Very Poor (70-80%)": int(((s>=70)&(s<80)).sum()),
+            "Poor (80-90%)":      int(((s>=80)&(s<90)).sum()),
+            "Fair (90-95%)":      int(((s>=90)&(s<95)).sum()),
+            "Good (95-99%)":      int(((s>=95)&(s<99)).sum()),
+            "Excellent (≥99%)":   int((s>=99).sum()),
+        })
+    if bucket_rows:
+        bk_df = pd.DataFrame(bucket_rows)
+        bk_cat = ["Critical (<70%)","Very Poor (70-80%)","Poor (80-90%)",
+                  "Fair (90-95%)","Good (95-99%)","Excellent (≥99%)"]
+        bk_melt = bk_df.melt("OA", bk_cat, var_name="Bucket", value_name="Sites")
+        fig_bk = px.bar(
+            bk_melt, x="OA", y="Sites", color="Bucket",
+            barmode="stack", title=f"{bk_tech} Availability Buckets by OA — {latest_av_m.upper()}",
+            color_discrete_map={
+                "Critical (<70%)":"#d7191c","Very Poor (70-80%)":"#f46d43",
+                "Poor (80-90%)":"#fdae61","Fair (90-95%)":"#e0f3f8",
+                "Good (95-99%)":"#a6d96a","Excellent (≥99%)":"#1a9641"},
+            category_orders={"Bucket": bk_cat}
+        )
+        st.plotly_chart(fig_bk, use_container_width=True)
+        st.dataframe(bk_df, use_container_width=True, hide_index=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TAB 13 – Period Summary Report
+# ═══════════════════════════════════════════════════════════════════════════════
+
+with tabs[12]:
+    st.header("📊 Period Summary Report")
+    st.caption(
+        "Select the performance months and revenue months you want to analyse. "
+        "Availability and revenue are computed only for the selected periods. "
+        "SDCA is pulled from the latest uploaded RBC file."
+    )
+
+    # ── Month selectors ────────────────────────────────────────────────────────
+    all_perf_months = sorted(st.session_state.master_df["Month_Label"].unique(),
+                             key=month_sort_key) if st.session_state.master_df is not None else []
+    all_rev_months  = sorted(st.session_state.rev_df.keys(), key=month_sort_key)                       if st.session_state.rev_df else []
+
+    ps_c1, ps_c2 = st.columns(2)
+    with ps_c1:
+        ps_perf_sel = st.multiselect(
+            "📅 Select Performance Month(s)",
+            all_perf_months,
+            default=all_perf_months[-2:] if len(all_perf_months) >= 2 else all_perf_months,
+            key="ps_perf_months"
+        )
+    with ps_c2:
+        ps_rev_sel = st.multiselect(
+            "💰 Select Revenue Month(s)",
+            all_rev_months,
+            default=all_rev_months[-2:] if len(all_rev_months) >= 2 else all_rev_months,
+            key="ps_rev_months"
+        )
+
+    if not ps_perf_sel and not ps_rev_sel:
+        st.warning("Please select at least one performance month or revenue month.")
+    else:
+      if True:
+        # ── Filtered perf data ─────────────────────────────────────────────────
+        ps_perf_df = pd.DataFrame()
+        if ps_perf_sel and st.session_state.master_df is not None:
+            ps_perf_df = st.session_state.master_df[
+                st.session_state.master_df["Month_Label"].isin(ps_perf_sel)
+            ].copy()
+            # Remap SDCA from latest RBC (most authoritative)
+            if rev_store:
+                _ps_sdca_src = rev_store[sorted(rev_store.keys(), key=month_sort_key)[-1]]
+                if "SDCANAME" in _ps_sdca_src.columns:
+                    _ps_lkp = (
+                        _ps_sdca_src[["BTSIPID","SDCANAME"]]
+                        .dropna(subset=["SDCANAME"]).drop_duplicates("BTSIPID")
+                        .set_index("BTSIPID")["SDCANAME"]
+                        .str.strip().str.title()
+                        .str.replace("Tirupathur","Tirupattur",regex=False)
+                    )
+                    ps_perf_df["SDCA"] = ps_perf_df["BTS IP ID"].map(_ps_lkp).fillna(
+                        ps_perf_df["SDCA"].str.strip().str.title()
+                        if "SDCA" in ps_perf_df.columns
+                        else pd.Series("Unknown", index=ps_perf_df.index)
+                    ).fillna("Unknown")
+
+        # ── Filtered revenue data ──────────────────────────────────────────────
+        ps_rev_dfs = []
+        if ps_rev_sel:
+            for _m in ps_rev_sel:
+                if _m in rev_store:
+                    _rdf = rev_store[_m].copy()
+                    _rdf["Rev_Month"] = _m
+                    if "SDCANAME" in _rdf.columns:
+                        _rdf["SDCA"] = (_rdf["SDCANAME"].str.strip().str.title()
+                                        .str.replace("Tirupathur","Tirupattur",regex=False))
+                    ps_rev_dfs.append(_rdf)
+        ps_rev_df = pd.concat(ps_rev_dfs, ignore_index=True) if ps_rev_dfs else pd.DataFrame()
+
+        st.markdown("---")
+
+        # ══════════════════════════════════════════════════════════════════════
+        # SECTION 1 – Availability Summary
+        # ══════════════════════════════════════════════════════════════════════
+        if not ps_perf_df.empty:
+            st.subheader(f"📶 Availability Summary — {', '.join(m.upper() for m in ps_perf_sel)}")
+
+            AVAIL_MAP_PS = {"2G":"Nw Avail (2G)","3G":"Nw Avail (3G)","4G TCS":"Nw Avail (4G TCS)"}
+            avail_ps = {t:c for t,c in AVAIL_MAP_PS.items() if c in ps_perf_df.columns}
+
+            # Overall KPI cards
+            kpi_cols_ps = st.columns(len(avail_ps) * 2)
+            ki = 0
+            for tech, col in avail_ps.items():
+                s = ps_perf_df[col].dropna()
+                kpi_cols_ps[ki].metric(f"{tech} Avg Avail",
+                                       f"{s.mean():.2f}%" if len(s) else "N/A")
+                kpi_cols_ps[ki+1].metric(f"{tech} <90% Sites",
+                                         f"{(s<90).sum()}" if len(s) else "N/A")
+                ki += 2
+
+            # Month × Technology availability table
+            st.markdown("**Month-wise Availability Summary**")
+            mom_ps_rows = []
+            for _m in ps_perf_sel:
+                _sub = ps_perf_df[ps_perf_df["Month_Label"]==_m]
+                row = {"Month": _m.upper(),
+                       "Sites": int(_sub["BTS IP ID"].nunique())}
+                for tech, col in avail_ps.items():
+                    s = _sub[col].dropna()
+                    row[f"{tech} Avg%"]  = round(s.mean(),2) if len(s) else None
+                    row[f"{tech} <90%"]  = int((s<90).sum()) if len(s) else 0
+                    row[f"{tech} <95%"]  = int((s<95).sum()) if len(s) else 0
+                    row[f"{tech} =100%"] = int((s==100).sum()) if len(s) else 0
+                mom_ps_rows.append(row)
+            mom_ps_df = pd.DataFrame(mom_ps_rows)
+
+            def _ps_colour(v):
+                try:
+                    fv = float(v)
+                    if fv < 90:  return "background-color:#f8d7da;color:#721c24"
+                    if fv < 95:  return "background-color:#fff3cd;color:#856404"
+                    return "background-color:#d4edda;color:#155724"
+                except: return ""
+
+            avg_ps_cols = [f"{t} Avg%" for t in avail_ps]
+            st.dataframe(safe_style(mom_ps_df, _ps_colour, avg_ps_cols),
+                         use_container_width=True, hide_index=True)
+
+            # Trend chart
+            if len(ps_perf_sel) >= 2:
+                fig_ps_trend = px.line(
+                    mom_ps_df.melt("Month", avg_ps_cols, var_name="Tech", value_name="Avg%"),
+                    x="Month", y="Avg%", color="Tech", markers=True,
+                    title="Availability Trend — Selected Months",
+                    color_discrete_map={"2G Avg%":"#636EFA","3G Avg%":"#EF553B","4G TCS Avg%":"#00CC96"}
+                )
+                fig_ps_trend.add_hline(y=90, line_dash="dash", line_color="red",
+                                       annotation_text="90%")
+                st.plotly_chart(fig_ps_trend, use_container_width=True)
+
+            # SDCA × Technology availability table (from selected months, SDCA from latest RBC)
+            st.markdown("**SDCA-wise Availability — Selected Period**")
+            if "SDCA" in ps_perf_df.columns:
+                sdca_ps_agg = {"Sites": ("BTS IP ID","nunique")}
+                for tech, col in avail_ps.items():
+                    sdca_ps_agg[f"{tech} Avg%"] = (col,"mean")
+                    sdca_ps_agg[f"{tech} <90%"] = (col, lambda x: (x<90).sum())
+                sdca_ps = ps_perf_df.groupby("SDCA").agg(**sdca_ps_agg).round(2).reset_index()
+                sdca_ps = sdca_ps.sort_values("Sites", ascending=False)
+                st.dataframe(safe_style(sdca_ps.reset_index(drop=True), _ps_colour, avg_ps_cols),
+                             use_container_width=True, hide_index=True)
+
+                # Heatmap: SDCA × Tech for selected period
+                hm_cols = [c for c in avg_ps_cols if c in sdca_ps.columns]
+                if hm_cols:
+                    hm_df = sdca_ps.set_index("SDCA")[hm_cols].rename(
+                        columns={c:c.replace(" Avg%","") for c in hm_cols})
+                    fig_ps_hm = go.Figure(data=go.Heatmap(
+                        z=hm_df.values.tolist(), x=hm_df.columns.tolist(),
+                        y=hm_df.index.tolist(),
+                        colorscale=[[0,"#d7191c"],[0.5,"#ffffbf"],[1,"#1a9641"]],
+                        zmin=70, zmax=100,
+                        text=[[f"{v:.1f}%" if pd.notna(v) else "N/A" for v in row]
+                              for row in hm_df.values.tolist()],
+                        texttemplate="%{text}", hoverongaps=False))
+                    fig_ps_hm.update_layout(
+                        title=f"SDCA × Technology Availability — {', '.join(m.upper() for m in ps_perf_sel)}",
+                        height=420)
+                    st.plotly_chart(fig_ps_hm, use_container_width=True)
+
+            st.markdown("---")
+
+        # ══════════════════════════════════════════════════════════════════════
+        # SECTION 2 – Revenue Summary
+        # ══════════════════════════════════════════════════════════════════════
+        if not ps_rev_df.empty:
+            st.subheader(f"💰 Revenue Summary — {', '.join(m.upper() for m in ps_rev_sel)}")
+
+            # Overall KPIs
+            rv1, rv2, rv3, rv4, rv5 = st.columns(5)
+            rv1.metric("Total Revenue (Lakhs)", f"₹{ps_rev_df['REV_LAKH'].sum():.2f}")
+            rv2.metric("Unique Sites", ps_rev_df["BTSIPID"].nunique())
+            rv3.metric("Months",        len(ps_rev_sel))
+            rv4.metric("Avg Rev/Site",  f"₹{ps_rev_df.groupby('BTSIPID')['REV_LAKH'].sum().mean():.3f}L")
+            rv5.metric("Zero Rev Sites",
+                       ps_rev_df.groupby("BTSIPID")["REV_LAKH"].sum().eq(0).sum())
+
+            # Month-wise revenue table
+            st.markdown("**Month-wise Revenue Summary**")
+            rev_mom_rows = []
+            for _m in ps_rev_sel:
+                _rdf = rev_store.get(_m, pd.DataFrame())
+                if _rdf.empty: continue
+                row = {"Month": _m.upper(),
+                       "Sites": int(_rdf["BTSIPID"].nunique()),
+                       "Total Rev (Lakhs)": round(_rdf["REV_LAKH"].sum(),2),
+                       "Avg Rev/Site": round(_rdf["REV_LAKH"].mean(),3),
+                       "Zero Rev Sites": int((_rdf["REV_LAKH"]==0).sum())}
+                for tech, rc in [("2G","2g_rev"),("3G","3g_rev"),("4G","4g_rev")]:
+                    if rc in _rdf.columns:
+                        row[f"{tech} Rev (Lakhs)"] = round(_rdf[rc].sum()/100000,2)
+                rev_mom_rows.append(row)
+            if rev_mom_rows:
+                rev_mom_df = pd.DataFrame(rev_mom_rows)
+                st.dataframe(rev_mom_df.reset_index(drop=True),
+                             use_container_width=True, hide_index=True)
+
+                # Bar chart: revenue by month
+                if len(ps_rev_sel) >= 2:
+                    fig_rev_mom = px.bar(rev_mom_df, x="Month", y="Total Rev (Lakhs)",
+                                        color="Month", text="Total Rev (Lakhs)",
+                                        title="Revenue by Selected Month")
+                    fig_rev_mom.update_traces(texttemplate="₹%{text:.2f}L",
+                                              textposition="outside")
+                    st.plotly_chart(fig_rev_mom, use_container_width=True)
+
+            # SDCA Revenue summary from RBC
+            st.markdown("**SDCA-wise Revenue — Selected Period**")
+            if "SDCA" in ps_rev_df.columns:
+                sdca_rev_ps = ps_rev_df.groupby("SDCA").agg(
+                    Sites=("BTSIPID","nunique"),
+                    Total_Rev=("REV_LAKH","sum"),
+                    Avg_Rev=("REV_LAKH","mean"),
+                    Zero_Sites=("REV_LAKH", lambda x:(x==0).sum()),
+                ).round(3).reset_index().sort_values("Total_Rev", ascending=False)
+                for tech, rc in [("2G","2g_rev"),("3G","3g_rev"),("4G","4g_rev")]:
+                    if rc in ps_rev_df.columns:
+                        ps_rev_df[f"_{tech}_L"] = ps_rev_df[rc]/100000
+                        sdca_rev_ps = sdca_rev_ps.merge(
+                            ps_rev_df.groupby("SDCA")[f"_{tech}_L"].sum().round(2).rename(f"{tech} Rev(L)"),
+                            on="SDCA", how="left")
+
+                srev_c1, srev_c2 = st.columns([1.4, 1])
+                with srev_c1:
+                    fig_srev_ps = px.bar(sdca_rev_ps, x="SDCA", y="Total_Rev",
+                                         color="Total_Rev", color_continuous_scale="Greens",
+                                         text="Total_Rev",
+                                         title="Revenue by SDCA — Selected Period")
+                    fig_srev_ps.update_traces(texttemplate="₹%{text:.2f}L",
+                                              textposition="outside")
+                    fig_srev_ps.update_layout(coloraxis_showscale=False)
+                    st.plotly_chart(fig_srev_ps, use_container_width=True)
+                with srev_c2:
+                    st.dataframe(sdca_rev_ps.reset_index(drop=True),
+                                 use_container_width=True, hide_index=True)
+
+            st.markdown("---")
+
+        # ══════════════════════════════════════════════════════════════════════
+        # SECTION 3 – Site Discrepancy Report
+        # ══════════════════════════════════════════════════════════════════════
+        st.subheader("⚠️ Site Discrepancy Report — Perf vs Revenue")
+        st.caption(
+            "Sites present in performance files but missing from revenue files, and vice-versa. "
+            "Based on BTS IP ID (perf) matched against BTSIPID (revenue)."
+        )
+
+        if ps_perf_df.empty or ps_rev_df.empty:
+            st.info("Select both performance and revenue months to see discrepancy report.")
+        else:
+            disc_c1, disc_c2 = st.columns(2)
+
+            perf_sites_ps = set(ps_perf_df["BTS IP ID"].astype(str).str.strip().unique())
+            rev_sites_ps  = set(ps_rev_df["BTSIPID"].astype(str).str.strip().unique())
+
+            with disc_c1:
+                only_perf = sorted(perf_sites_ps - rev_sites_ps)
+                st.markdown(f"**🔵 In Perf but NOT in Revenue: {len(only_perf)} sites**")
+                st.caption("These sites report performance data but have no billing record.")
+                if only_perf:
+                    op_df = ps_perf_df[ps_perf_df["BTS IP ID"].isin(only_perf)]                        .drop_duplicates("BTS IP ID")                        [["BTS IP ID"] + [c for c in ["BTS Name","SDCA","SSAID","BTS Area","Band category"]
+                                          if c in ps_perf_df.columns]]                        .reset_index(drop=True)
+                    st.dataframe(op_df, use_container_width=True, hide_index=True)
+
+            with disc_c2:
+                only_rev = sorted(rev_sites_ps - perf_sites_ps)
+                st.markdown(f"**🟡 In Revenue but NOT in Perf: {len(only_rev)} sites**")
+                st.caption("These sites have billing records but no performance data uploaded.")
+                if only_rev:
+                    or_df = ps_rev_df[ps_rev_df["BTSIPID"].isin(only_rev)]                        .drop_duplicates("BTSIPID")                        [["BTSIPID"] + [c for c in ["SITENAME","SDCA","SSACODE","LOCATION"]
+                                        if c in ps_rev_df.columns]]                        .reset_index(drop=True)
+                    st.dataframe(or_df, use_container_width=True, hide_index=True)
+
+            # Summary metric
+            common = perf_sites_ps & rev_sites_ps
+            d1, d2, d3, d4 = st.columns(4)
+            d1.metric("Perf Sites",           len(perf_sites_ps))
+            d2.metric("Revenue Sites",         len(rev_sites_ps))
+            d3.metric("Common (matched)",      len(common))
+            d4.metric("Total Discrepancy",     len(only_perf) + len(only_rev),
+                      delta=None if (len(only_perf)+len(only_rev))==0 else
+                            f"{len(only_perf)} perf-only, {len(only_rev)} rev-only")
+
+            # Per-month discrepancy (if multiple months)
+            if len(ps_perf_sel) > 1 or len(ps_rev_sel) > 1:
+                st.markdown("**Per-month discrepancy breakdown**")
+                disc_rows = []
+                for _pm in ps_perf_sel:
+                    _p = set(ps_perf_df[ps_perf_df["Month_Label"]==_pm]["BTS IP ID"]
+                             .astype(str).str.strip().unique())
+                    for _rm in ps_rev_sel:
+                        _r = set(rev_store.get(_rm, pd.DataFrame()).get("BTSIPID",
+                             pd.Series(dtype=str)).astype(str).str.strip().unique())
+                        disc_rows.append({
+                            "Perf Month":  _pm.upper(),
+                            "Rev Month":   _rm.upper(),
+                            "Perf Sites":  len(_p),
+                            "Rev Sites":   len(_r),
+                            "Only Perf":   len(_p - _r),
+                            "Only Rev":    len(_r - _p),
+                            "Common":      len(_p & _r),
+                        })
+                st.dataframe(pd.DataFrame(disc_rows), use_container_width=True, hide_index=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TAB 14 – Vendor-wise Availability
+# ═══════════════════════════════════════════════════════════════════════════════
+
+with tabs[13]:
+    st.header("🏭 Vendor-wise Availability")
+    st.caption(
+        "Availability breakdown by equipment vendor for each technology. "
+        "2G/3G vendors from perf file columns; 4G vendor is Tejas (all sites)."
+    )
+
+    if st.session_state.master_df is None:
+        st.info("Upload performance files to enable this tab.")
+    else:
+      if True:
+        # ── Month selector ─────────────────────────────────────────────────────
+        va_all_months = sorted(st.session_state.master_df["Month_Label"].unique(),
+                               key=month_sort_key)
+        va_c1, va_c2 = st.columns([3,1])
+        with va_c1:
+            va_months = st.multiselect(
+                "Select Month(s)",
+                va_all_months,
+                default=va_all_months,
+                key="va_months"
+            )
+        with va_c2:
+            va_thr = st.slider("Poor threshold %", 80, 98, 90, 1, key="va_thr")
+
+        if not va_months:
+            st.warning("Select at least one month.")
+        else:
+          if True:
+            va_df = st.session_state.master_df[
+                st.session_state.master_df["Month_Label"].isin(va_months)
+            ].copy()
+            for _c in ["Nw Avail (2G)","Nw Avail (3G)","Nw Avail (4G TCS)"]:
+                if _c in va_df.columns:
+                    va_df[_c] = pd.to_numeric(va_df[_c], errors="coerce")
+
+            VENDOR_TECH_MAP = {
+                "2G": ("Vendor_2G_Derived", "Nw Avail (2G)"),
+                "3G": ("Vendor_3G_Derived", "Nw Avail (3G)"),
+                "4G": ("Vendor_4G_Derived", "Nw Avail (4G TCS)"),
+            }
+
+            st.markdown("---")
+
+            # ══════════════════════════════════════════════════════════════════
+            # SECTION 1 – Overall Vendor Summary Table
+            # ══════════════════════════════════════════════════════════════════
+            st.subheader("📋 Vendor × Technology Summary")
+            va_summary_rows = []
+            for tech, (ven_col, avail_col) in VENDOR_TECH_MAP.items():
+                if ven_col not in va_df.columns or avail_col not in va_df.columns:
+                    continue
+                for vendor in sorted(va_df[ven_col].dropna().unique()):
+                    sub = va_df[va_df[ven_col]==vendor][avail_col].dropna()
+                    if len(sub) == 0: continue
+                    va_summary_rows.append({
+                        "Technology": tech,
+                        "Vendor": vendor,
+                        "Sites": int(va_df[va_df[ven_col]==vendor]["BTS IP ID"].nunique()),
+                        "Avg Avail%": round(sub.mean(), 2),
+                        "Min%": round(sub.min(), 2),
+                        "Max%": round(sub.max(), 2),
+                        f"<{va_thr}% Sites": int((sub < va_thr).sum()),
+                        "≥95% Sites": int((sub >= 95).sum()),
+                        "=100% Sites": int((sub == 100).sum()),
+                    })
+            if va_summary_rows:
+                va_summ_df = pd.DataFrame(va_summary_rows)
+
+                def _va_colour(v):
+                    try:
+                        fv = float(v)
+                        if fv < 90:  return "background-color:#f8d7da;color:#721c24"
+                        if fv < 95:  return "background-color:#fff3cd;color:#856404"
+                        return "background-color:#d4edda;color:#155724"
+                    except: return ""
+
+                st.dataframe(safe_style(va_summ_df, _va_colour, ["Avg Avail%"]),
+                             use_container_width=True, hide_index=True)
+
+                # Grouped bar: avg availability by vendor, facet by technology
+                fig_va_bar = px.bar(
+                    va_summ_df, x="Vendor", y="Avg Avail%",
+                    color="Technology", barmode="group",
+                    facet_col="Technology", text="Avg Avail%",
+                    title="Avg Availability by Vendor & Technology",
+                    color_discrete_map={"2G":"#636EFA","3G":"#EF553B","4G":"#00CC96"}
+                )
+                fig_va_bar.update_traces(texttemplate="%{text:.1f}%", textposition="outside")
+                fig_va_bar.add_hline(y=va_thr, line_dash="dash", line_color="red")
+                fig_va_bar.update_layout(yaxis_range=[70,105])
+                st.plotly_chart(fig_va_bar, use_container_width=True)
+
+            st.markdown("---")
+
+            # ══════════════════════════════════════════════════════════════════
+            # SECTION 2 – Per-Technology Deep Dive (tabs)
+            # ══════════════════════════════════════════════════════════════════
+            st.subheader("🔬 Per-Technology Vendor Analysis")
+            tech_va_tabs = st.tabs(["2G","3G","4G"])
+            for vt_tab, (tech, (ven_col, avail_col)) in zip(tech_va_tabs, VENDOR_TECH_MAP.items()):
+                with vt_tab:
+                    if ven_col not in va_df.columns or avail_col not in va_df.columns:
+                        st.info(f"No {tech} vendor/availability data in uploaded files.")
+                        continue
+
+                    vendors = sorted(va_df[ven_col].dropna().unique())
+                    if not vendors:
+                        st.info(f"No {tech} vendor data found.")
+                        continue
+
+                    # Month × Vendor availability table
+                    st.markdown(f"**{tech} Availability by Vendor × Month**")
+                    mv_rows = []
+                    for _m in va_months:
+                        _sub = va_df[va_df["Month_Label"]==_m]
+                        for vendor in vendors:
+                            _vs = _sub[_sub[ven_col]==vendor][avail_col].dropna()
+                            if len(_vs) == 0: continue
+                            mv_rows.append({
+                                "Month":   _m.upper(),
+                                "Vendor":  vendor,
+                                "Sites":   int(_sub[_sub[ven_col]==vendor]["BTS IP ID"].nunique()),
+                                "Avg%":    round(_vs.mean(), 2),
+                                "Min%":    round(_vs.min(), 2),
+                                "Max%":    round(_vs.max(), 2),
+                                f"<{va_thr}%": int((_vs < va_thr).sum()),
+                                "<90%":    int((_vs < 90).sum()),
+                                "<80%":    int((_vs < 80).sum()),
+                            })
+                    if mv_rows:
+                        mv_df = pd.DataFrame(mv_rows)
+                        st.dataframe(safe_style(mv_df, _va_colour, ["Avg%"]),
+                                     use_container_width=True, hide_index=True)
+
+                        # Line chart: trend by vendor
+                        if len(va_months) >= 2:
+                            fig_vt_line = px.line(
+                                mv_df, x="Month", y="Avg%", color="Vendor", markers=True,
+                                title=f"{tech} Availability Trend by Vendor",
+                                color_discrete_sequence=px.colors.qualitative.Set1
+                            )
+                            fig_vt_line.add_hline(y=va_thr, line_dash="dash",
+                                                  line_color="red",
+                                                  annotation_text=f"{va_thr}%")
+                            st.plotly_chart(fig_vt_line, use_container_width=True)
+
+                    # Distribution histogram by vendor
+                    st.markdown(f"**{tech} Availability Distribution by Vendor**")
+                    fig_vt_hist = px.histogram(
+                        va_df[va_df[ven_col].notna()], x=avail_col,
+                        color=ven_col, nbins=30, barmode="overlay", opacity=0.7,
+                        title=f"{tech} Availability Distribution",
+                        labels={avail_col:"Availability %", ven_col:"Vendor"},
+                        color_discrete_sequence=px.colors.qualitative.Set1
+                    )
+                    fig_vt_hist.add_vline(x=va_thr, line_dash="dash", line_color="red",
+                                          annotation_text=f"{va_thr}%")
+                    st.plotly_chart(fig_vt_hist, use_container_width=True)
+
+                    # Worst sites per vendor
+                    st.markdown(f"**{tech} Worst 10 Sites per Vendor**")
+                    for vendor in vendors:
+                        vend_sub = va_df[
+                            (va_df[ven_col]==vendor) &
+                            (va_df["Month_Label"]==va_months[-1])
+                        ][["BTS IP ID","BTS Name","SDCA",avail_col] if "SDCA" in va_df.columns
+                          else ["BTS IP ID","BTS Name",avail_col]].dropna(subset=[avail_col])
+                        worst_v = vend_sub.nsmallest(10, avail_col)
+                        if len(worst_v) == 0: continue
+                        with st.expander(
+                            f"{vendor} — worst 10 in {va_months[-1].upper()} "
+                            f"(avg {vend_sub[avail_col].mean():.1f}%)",
+                            expanded=(worst_v[avail_col].max() < va_thr)
+                        ):
+                            st.dataframe(worst_v.reset_index(drop=True),
+                                         use_container_width=True, hide_index=True)
+
+            st.markdown("---")
+
+            # ══════════════════════════════════════════════════════════════════
+            # SECTION 3 – Month-on-Month Vendor Change
+            # ══════════════════════════════════════════════════════════════════
+            if len(va_months) >= 2:
+                st.subheader("📉 Month-on-Month Vendor Availability Change")
+                m_prev_va = va_months[-2]
+                m_curr_va = va_months[-1]
+                st.caption(f"Comparing {m_prev_va.upper()} → {m_curr_va.upper()}")
+
+                for tech, (ven_col, avail_col) in VENDOR_TECH_MAP.items():
+                    if ven_col not in va_df.columns or avail_col not in va_df.columns:
+                        continue
+                    chg_rows = []
+                    for vendor in sorted(va_df[ven_col].dropna().unique()):
+                        prev_v = va_df[(va_df["Month_Label"]==m_prev_va) &
+                                       (va_df[ven_col]==vendor)][avail_col].dropna()
+                        curr_v = va_df[(va_df["Month_Label"]==m_curr_va) &
+                                       (va_df[ven_col]==vendor)][avail_col].dropna()
+                        if len(prev_v) == 0 or len(curr_v) == 0: continue
+                        chg_rows.append({
+                            "Vendor": vendor,
+                            f"{m_prev_va.upper()} Avg%": round(prev_v.mean(),2),
+                            f"{m_curr_va.upper()} Avg%": round(curr_v.mean(),2),
+                            "Change%": round(curr_v.mean()-prev_v.mean(),2),
+                        })
+                    if chg_rows:
+                        chg_df = pd.DataFrame(chg_rows)
+                        st.markdown(f"**{tech}**")
+
+                        def _chg_col(v):
+                            try:
+                                fv = float(v)
+                                if fv < -1: return "background-color:#f8d7da;color:#721c24"
+                                if fv > 1:  return "background-color:#d4edda;color:#155724"
+                            except: pass
+                            return ""
+
+                        st.dataframe(safe_style(chg_df, _chg_col, ["Change%"]),
+                                     use_container_width=True, hide_index=True)
+
+
+
+# TAB 15 – Executive Report
+# ═══════════════════════════════════════════════════════════════════════════════
+
+with tabs[14]:
     st.header("Executive Report Card")
     df_exec = df_lat.copy()
     st.subheader(f"Vendor–Technology Matrix  ·  {latest_month}")
